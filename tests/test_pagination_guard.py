@@ -1029,6 +1029,16 @@ class CommentedArgumentsAreNotArguments(unittest.TestCase):
     def test_ruby_interpolation_is_not_a_comment(self):
         self.assertEqual(conn('q = "{ orders(first: 10, query: #{q}, after: $c) { nodes { id } } }"\n', "x.rb"), [])
 
+    def test_newline_escape_text_inside_a_native_graphql_comment_does_not_end_it(self):
+        # DeepReview round 2: in a .graphql/.gql document `\n` is just comment text
+        src = "query { orders(first: 100 # note\\n after: $c\n) { nodes { id } } }"
+        self.assertEqual(len(conn(src, "q.graphql")), 1)
+        self.assertEqual(len(conn(src, "q.gql")), 1)
+        self.assertEqual(conn(src, "q.js"), [])   # host code: the escape ends the GraphQL line
+
+    def test_hash_brace_in_a_native_graphql_file_is_a_comment(self):
+        self.assertEqual(len(conn("query { orders(first: 10 #{after: $c}\n) { nodes { id } } }", "q.graphql")), 1)
+
     def test_commented_last_does_not_change_the_direction(self):
         # forward connection whose only metadata is backward: a commented `last:` must not make it "both ways"
         src = "query { orders(first: 10 # last: 5\n) { nodes { id } pageInfo { hasPreviousPage } } }"
