@@ -1,0 +1,3 @@
+# Vendored pagination_guard copies must stay byte-identical (LF) on every checkout.
+scripts/pagination_guard.py text eol=lf
+tests/*.py text eol=lf
