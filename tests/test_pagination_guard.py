@@ -849,5 +849,23 @@ class GitStaged(TempDirCase):
         self.assertEqual(json.loads(r.stdout), [])
 
 
+    def test_staged_type_change_to_regular_file_is_scanned(self):
+        self.init_repo()
+        link = os.path.join(self.tmp, "a.js")
+        try:
+            os.symlink("target.txt", link)
+        except (AttributeError, NotImplementedError, OSError):
+            self.skipTest("symlinks unavailable")
+        self.git("add", "a.js")
+        self.git("commit", "-q", "-m", "symlink")
+        os.remove(link)
+        self.write("a.js", UNBOUNDED_JS)               # now a regular file: git status type T
+        self.git("add", "a.js")
+        self.assertTrue(self.git("diff", "--cached", "--name-status").startswith("T"))
+        r = run_guard(["--git-staged", "--json"], self.tmp)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual([f["file"] for f in json.loads(r.stdout)], ["a.js"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,10 +31,12 @@ slice, or the collection is provably smaller than the page (say why).
 Usage:
   pagination_guard.py [paths...]          scan files/dirs (default: .)
   pagination_guard.py --git-staged        scan staged files only, as staged in the index (pre-commit;
-                                          added/copied/modified/renamed)
+                                          added/copied/modified/renamed/type-changed)
   pagination_guard.py --json              machine-readable findings
   pagination_guard.py --version           print GUARD_VERSION and exit
-Exit 1 when any unmarked finding exists.
+Exit 1 when any unmarked finding exists; exit 2 when git cannot be queried (--git-staged).
+--git-staged scans the staged (index) content and the staged .pagination-guard-ignore; path
+arguments are ignored in that mode.
 
 SYNC: pagination_guard - canonical copy is Fuzzywumpets/claude-bootstrap scripts/pagination_guard.py;
 vendored copies live in each repo at scripts/pagination_guard.py (or tools/). Update all
@@ -90,16 +92,21 @@ REST_FOLLOW_RE = re.compile(
     r"total_pages|totalPages|[\"']next[\"']|\.next\b(?!\s*\()|\bnext_?(?:url|link|page|cursor|token)\b")
 
 
+def parse_ignores(text):
+    out = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith("#"):
+            out.append(ln.replace("\\", "/").rstrip("/"))
+    return out
+
+
 def load_ignores(root):
     p = os.path.join(root, IGNORE_FILE)
-    out = []
     if os.path.isfile(p):
         with open(p, encoding="utf-8", errors="replace") as fh:
-            for ln in fh:
-                ln = ln.strip()
-                if ln and not ln.startswith("#"):
-                    out.append(ln.replace("\\", "/").rstrip("/"))
-    return out
+            return parse_ignores(fh.read())
+    return []
 
 
 def ignored(rel, ignores):
@@ -266,47 +273,81 @@ def scan_unread_pageinfo(path, text, lines):
     return out
 
 
+class GitError(Exception):
+    """git could not be queried; a staged scan must fail, not pass as clean."""
+
+
+def _git(args):
+    try:
+        r = subprocess.run(["git"] + args, capture_output=True, check=False)
+    except OSError as e:
+        raise GitError("cannot run git: %s" % e)
+    if r.returncode != 0:
+        raise GitError("git %s failed (exit %d): %s" % (
+            " ".join(args[:2]), r.returncode, r.stderr.decode("utf-8", "replace").strip()))
+    return r.stdout
+
+
 def _universal_newlines(s):
     return s.replace("\r\n", "\n").replace("\r", "\n")    # what text-mode open() does
 
 
 def staged_files():
-    """Staged added/copied/modified/renamed code files, as repo-root-relative names.
+    """Staged added/copied/modified/renamed/type-changed code files, as repo-root-relative names.
     `-z` keeps git from quoting non-ASCII or special names."""
-    out = subprocess.run(["git", "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"],
-                         capture_output=True, check=False).stdout
+    out = _git(["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRT"])
     names = [os.fsdecode(n) for n in out.split(b"\0") if n]
     return [n for n in names if os.path.splitext(n)[1].lower() in EXTS]
 
 
 def git_toplevel():
-    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, check=False)
-    return os.fsdecode(r.stdout).strip() if r.returncode == 0 and r.stdout.strip() else None
+    top = os.fsdecode(_git(["rev-parse", "--show-toplevel"])).strip()
+    if not top:
+        raise GitError("git rev-parse --show-toplevel returned nothing")
+    return top
 
 
 def staged_text(name):
-    """The file as staged in the index (not the working tree), or None if unreadable/too big.
+    """The file as staged in the index (not the working tree), or None if too big.
     `:0:` is the stage-0 index entry; `name` is repo-root-relative."""
-    r = subprocess.run(["git", "cat-file", "blob", ":0:" + name], capture_output=True, check=False)
-    if r.returncode != 0 or len(r.stdout) > MAX_BYTES:
+    data = _git(["cat-file", "blob", ":0:" + name])
+    if len(data) > MAX_BYTES:
         return None
-    return _universal_newlines(r.stdout.decode("utf-8", errors="replace"))
+    return _universal_newlines(data.decode("utf-8", errors="replace"))
+
+
+def staged_ignores(root, top):
+    """.pagination-guard-ignore as staged (an unstaged one is not part of the commit)."""
+    name = os.path.relpath(os.path.join(root, IGNORE_FILE), top).replace(os.sep, "/")
+    if not _git(["--literal-pathspecs", "ls-files", "-z", "--cached", "--", name]):
+        return []
+    return parse_ignores(staged_text(name) or "")
 
 
 def main(argv):
     if "--version" in argv:
         print(GUARD_VERSION)
         return 0
+    try:
+        return run(argv)
+    except GitError as e:
+        print("pagination_guard: %s" % e, file=sys.stderr)
+        return 2
+
+
+def run(argv):
     as_json = "--json" in argv
     args = [a for a in argv if not a.startswith("--")]
     root = os.getcwd()
-    ignores = load_ignores(root)
     staged = "--git-staged" in argv
     if staged:
-        # (name in the index, path on disk used for display/ignore matching relative to the cwd)
-        top = git_toplevel() or root
+        # (name in the index, path used for display/ignore matching relative to the cwd);
+        # path arguments are ignored in this mode
+        top = git_toplevel()
+        ignores = staged_ignores(root, top)
         files = [(n, os.path.join(top, n)) for n in staged_files()]
     else:
+        ignores = load_ignores(root)
         files = [(f, f) for f in iter_files(args or ["."])]
     findings = []
     for name, f in files:

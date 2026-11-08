@@ -15,7 +15,7 @@ An honest top-N or a single-record lookup is exempted with `# BOUNDED: <reason>`
 
 ```
 python3 scripts/pagination_guard.py [paths...]   # scan files/dirs (default: .)
-python3 scripts/pagination_guard.py --git-staged # staged files only (pre-commit)
+python3 scripts/pagination_guard.py --git-staged # staged (index) content only, for pre-commit; exit 2 if git fails
 python3 scripts/pagination_guard.py --json       # machine-readable findings
 python3 scripts/pagination_guard.py --version    # print GUARD_VERSION
 ```
