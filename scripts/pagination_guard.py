@@ -20,6 +20,7 @@ KNOWN LIMITS (deliberate; this is a tripwire, not a proof -- review still owns c
   * helper-call names (paginate/drain/walk/...) count as "pageInfo consumed";
   * queries assembled from string constants are only seen where the literal text is present;
   * `first:` + `before:` (or `last:` + `after:`) is accepted as "has a cursor" without checking the direction;
+  * a commented-out `pageInfo { hasNextPage }` inside a selection set still counts as selected;
   * "pageInfo is read" is a text match: `.hasNextPage`, `["hasNextPage"]`, `.get("hasNextPage")` and a
     destructuring pattern naming hasNextPage/endCursor followed by `=` all count; only the forward
     (`hasNextPage`) request is checked for being read.
@@ -29,7 +30,8 @@ slice, or the collection is provably smaller than the page (say why).
 
 Usage:
   pagination_guard.py [paths...]          scan files/dirs (default: .)
-  pagination_guard.py --git-staged        scan staged files only (pre-commit; added/copied/modified/renamed)
+  pagination_guard.py --git-staged        scan staged files only, as staged in the index (pre-commit;
+                                          added/copied/modified/renamed)
   pagination_guard.py --json              machine-readable findings
   pagination_guard.py --version           print GUARD_VERSION and exit
 Exit 1 when any unmarked finding exists.
@@ -66,8 +68,10 @@ CONN_RE = re.compile(
 CURSOR_ARG_RE = re.compile(r"\b(after|before)\s*:")
 FIRST_ARG_RE = re.compile(r"\bfirst\s*:")
 LAST_ARG_RE = re.compile(r"\blast\s*:")
-# Directives (`@include(if: $x)`, `@live`) may sit between the arguments and the selection set.
-DIRECTIVES_RE = re.compile(r"(?:\s*@[A-Za-z_]\w*(?:\s*\([^()]*\))?)*\s*")
+# Between the arguments and the selection set GraphQL allows directives (`@include(if: $x)`,
+# `@live`) and ignored tokens: whitespace and `# comments` up to the end of the line.
+_IGNORED = r"(?:\s|#[^\n]*)*"
+DIRECTIVES_RE = re.compile(_IGNORED + r"(?:@[A-Za-z_]\w*(?:\s*\([^()]*\))?" + _IGNORED + r")*")
 # Own-level pageInfo, per paging direction: forward needs hasNextPage, backward hasPreviousPage.
 PAGEINFO_NEXT_RE = re.compile(r"pageInfo\s*\{[^{}]*hasNextPage", re.S)
 PAGEINFO_PREV_RE = re.compile(r"pageInfo\s*\{[^{}]*hasPreviousPage", re.S)
@@ -181,7 +185,7 @@ def scan_text(path, text):
             continue
         # Python/JS kwargs `func(first=..)` use '=' so they never match ':'; JS object
         # literals `fn({first: 10})` contain '{' and are excluded by [^()]. Require
-        # GraphQL-ish context: after optional directives the next non-space char is '{'.
+        # GraphQL-ish context: after optional directives/comments the next token is '{'.
         k = DIRECTIVES_RE.match(text, m.end()).end()
         if k >= len(text) or text[k] != "{":
             continue
@@ -262,11 +266,31 @@ def scan_unread_pageinfo(path, text, lines):
     return out
 
 
+def _universal_newlines(s):
+    return s.replace("\r\n", "\n").replace("\r", "\n")    # what text-mode open() does
+
+
 def staged_files():
-    out = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-                         capture_output=True, text=True, check=False).stdout
-    return [f for f in out.splitlines()
-            if os.path.splitext(f)[1].lower() in EXTS and os.path.isfile(f)]
+    """Staged added/copied/modified/renamed code files, as repo-root-relative names.
+    `-z` keeps git from quoting non-ASCII or special names."""
+    out = subprocess.run(["git", "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"],
+                         capture_output=True, check=False).stdout
+    names = [os.fsdecode(n) for n in out.split(b"\0") if n]
+    return [n for n in names if os.path.splitext(n)[1].lower() in EXTS]
+
+
+def git_toplevel():
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, check=False)
+    return os.fsdecode(r.stdout).strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def staged_text(name):
+    """The file as staged in the index (not the working tree), or None if unreadable/too big.
+    `:0:` is the stage-0 index entry; `name` is repo-root-relative."""
+    r = subprocess.run(["git", "cat-file", "blob", ":0:" + name], capture_output=True, check=False)
+    if r.returncode != 0 or len(r.stdout) > MAX_BYTES:
+        return None
+    return _universal_newlines(r.stdout.decode("utf-8", errors="replace"))
 
 
 def main(argv):
@@ -277,19 +301,30 @@ def main(argv):
     args = [a for a in argv if not a.startswith("--")]
     root = os.getcwd()
     ignores = load_ignores(root)
-    files = staged_files() if "--git-staged" in argv else list(iter_files(args or ["."]))
+    staged = "--git-staged" in argv
+    if staged:
+        # (name in the index, path on disk used for display/ignore matching relative to the cwd)
+        top = git_toplevel() or root
+        files = [(n, os.path.join(top, n)) for n in staged_files()]
+    else:
+        files = [(f, f) for f in iter_files(args or ["."])]
     findings = []
-    for f in files:
+    for name, f in files:
         rel = os.path.relpath(f, root)
         if ignored(rel, ignores):
             continue
-        try:
-            if os.path.getsize(f) > MAX_BYTES:
+        if staged:
+            text = staged_text(name)      # scan what will be committed, not the working tree
+            if text is None:
                 continue
-            with open(f, encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
-        except OSError:
-            continue
+        else:
+            try:
+                if os.path.getsize(f) > MAX_BYTES:
+                    continue
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
         low = text.lower()
         # cheap prefilter; SYNC: must cover every token CONN_RE / REST_LIMIT_RE can match
         if not any(t in low for t in ("first", "last", "limit", "page", "maxresults", "max_results",
