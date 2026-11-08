@@ -358,6 +358,45 @@ class DirectivesBeforeSelectionSet(unittest.TestCase):
         self.assertEqual(conn("rows = load(first: 10) @cached\n"), [])
 
 
+class CommentsBeforeSelectionSet(unittest.TestCase):
+    """GraphQL comments (`# ...`) are ignored tokens between the arguments and the selection set."""
+
+    def test_comment_between_args_and_selection_set(self):
+        found = conn("query { things(first: 10) # fetch things\n { nodes { id } } }", "q.graphql")
+        self.assertEqual([f["line"] for f in found], [1])
+
+    def test_comment_on_its_own_line(self):
+        found = conn("""\
+            query {
+              things(first: 10)
+              # the selection set follows
+              { nodes { id } }
+            }
+        """, "q.graphql")
+        self.assertEqual([f["line"] for f in found], [2])
+
+    def test_comments_and_directives_interleaved(self):
+        src = ("const q = `{ things(first: 10) # a\n @include(if: $x) # b\n @skip(if: $y) # c\n"
+               " { nodes { id } } }`;")
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_brace_inside_comment_is_not_the_selection_set(self):
+        src = "const q = `{ things(first: 10) # not { this }\n { nodes { id } pageInfo { hasNextPage } } }`;"
+        self.assertEqual(conn(src), [])
+        src = "const q = `{ things(first: 10) # not { this }\n { nodes { id } } }`;"
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_comment_with_after_cursor_is_fine(self):
+        self.assertEqual(conn("query { things(first: 10, after: $c) # page\n { nodes { id } } }", "q.graphql"), [])
+
+    def test_comment_with_own_level_pageinfo_is_fine(self):
+        src = "query { things(first: 10) # page\n { nodes { id } pageInfo { hasNextPage endCursor } } }"
+        self.assertEqual(conn(src, "q.graphql"), [])
+
+    def test_bounded_marker_in_the_comment(self):
+        self.assertEqual(conn("query { things(first: 10) # BOUNDED: top 10\n { nodes { id } } }", "q.graphql"), [])
+
+
 # --------------------------------------------------------------------------------------
 # Defect (b): backward pagination metadata must not satisfy a forward connection
 # --------------------------------------------------------------------------------------
@@ -722,6 +761,53 @@ class GitStaged(TempDirCase):
         self.git("add", "notes.txt")
         r = run_guard(["--git-staged", "--json"], self.tmp)
         self.assertEqual(json.loads(r.stdout), [])
+
+    def test_staged_content_is_scanned_not_the_working_tree(self):
+        self.init_repo()
+        self.write("a.js", UNBOUNDED_JS)
+        self.git("add", "a.js")
+        self.write("a.js", "const x = 1;\n")           # clean, but NOT staged
+        r = run_guard(["--git-staged", "--json"], self.tmp)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual([f["file"] for f in json.loads(r.stdout)], ["a.js"])
+
+    def test_staged_file_deleted_from_working_tree_is_still_scanned(self):
+        self.init_repo()
+        self.write("a.js", UNBOUNDED_JS)
+        self.git("add", "a.js")
+        os.remove(os.path.join(self.tmp, "a.js"))      # still in the index
+        r = run_guard(["--git-staged", "--json"], self.tmp)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual([f["file"] for f in json.loads(r.stdout)], ["a.js"])
+
+    def test_clean_staged_content_passes_even_if_working_tree_is_dirty(self):
+        self.init_repo()
+        self.write("a.js", "const x = 1;\n")
+        self.git("add", "a.js")
+        self.write("a.js", UNBOUNDED_JS)               # dirty, but NOT staged
+        r = run_guard(["--git-staged", "--json"], self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(r.stdout), [])
+
+    def test_staged_non_ascii_and_spaced_filenames_are_scanned(self):
+        self.init_repo()
+        self.git("config", "core.quotePath", "true")   # git's default: non-ASCII names come back quoted
+        self.write(u"caf\u00e9.js", UNBOUNDED_JS)
+        self.write("with space.js", UNBOUNDED_JS)
+        self.git("add", "--all")
+        r = run_guard(["--git-staged", "--json"], self.tmp)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(sorted(f["file"] for f in json.loads(r.stdout)), sorted([u"caf\u00e9.js", "with space.js"]))
+
+    def test_staged_scan_from_a_subdirectory_uses_cwd_relative_names(self):
+        self.init_repo()
+        self.write("sub/inner.js", UNBOUNDED_JS)
+        self.write("outer.js", UNBOUNDED_JS)
+        self.git("add", "--all")
+        r = run_guard(["--git-staged", "--json"], os.path.join(self.tmp, "sub"))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(sorted(f["file"] for f in json.loads(r.stdout)),
+                         sorted(["inner.js", os.path.join("..", "outer.js")]))
 
 
 if __name__ == "__main__":
