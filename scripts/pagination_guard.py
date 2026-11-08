@@ -5,7 +5,9 @@ Rule (convention_pagination_no_silent_caps.md): every GraphQL connection taking
 `first:`/`last:` must either
   * take an `after:`/`before:` cursor argument (it is the page of a cursor loop), or
   * select `pageInfo { hasNextPage ... }` at its own level (so overflow is detected
-    and followed up / failed closed by the caller),
+    and followed up / failed closed by the caller); a `last:` connection pages
+    backwards, so it needs `pageInfo { hasPreviousPage ... }` instead -- backward
+    metadata never satisfies a forward (`first:`) connection, nor the reverse,
 unless the line (or one of the 3 lines above it) carries an explicit marker:
     # BOUNDED: <reason>      (Python / shell / YAML)
     // BOUNDED: <reason>     (JS / TS)
@@ -16,26 +18,34 @@ next/nextPageToken/cursor/offset/page=/skip).
 KNOWN LIMITS (deliberate; this is a tripwire, not a proof -- review still owns correctness):
   * the REST rule is FILE-level: one paging token anywhere in the file silences every limit= in it;
   * helper-call names (paginate/drain/walk/...) count as "pageInfo consumed";
-  * queries assembled from string constants are only seen where the literal text is present.
+  * queries assembled from string constants are only seen where the literal text is present;
+  * `first:` + `before:` (or `last:` + `after:`) is accepted as "has a cursor" without checking the direction;
+  * "pageInfo is read" is a text match: `.hasNextPage`, `["hasNextPage"]`, `.get("hasNextPage")` and a
+    destructuring pattern naming hasNextPage/endCursor followed by `=` all count; only the forward
+    (`hasNextPage`) request is checked for being read.
 
 A BOUNDED marker is only honest when the user-visible output says it is a top-N
 slice, or the collection is provably smaller than the page (say why).
 
 Usage:
   pagination_guard.py [paths...]          scan files/dirs (default: .)
-  pagination_guard.py --git-staged        scan staged files only (pre-commit)
+  pagination_guard.py --git-staged        scan staged files only (pre-commit; added/copied/modified/renamed)
   pagination_guard.py --json              machine-readable findings
+  pagination_guard.py --version           print GUARD_VERSION and exit
 Exit 1 when any unmarked finding exists.
 
-SYNC: pagination_guard - canonical copy is C:/Users/AlexLass/.claude/scripts/pagination_guard.py;
+SYNC: pagination_guard - canonical copy is Fuzzywumpets/claude-bootstrap scripts/pagination_guard.py;
 vendored copies live in each repo at scripts/pagination_guard.py (or tools/). Update all
 together; `diff` them against the canonical copy. Stdlib only, Python 3.8+.
+Tests: tests/test_pagination_guard.py in the canonical repo (`python3 -m unittest discover -s tests`).
 """
 import json
 import os
 import re
 import subprocess
 import sys
+
+GUARD_VERSION = "2026-11-08"   # bump on every behaviour change; `--version` prints it
 
 SKIP_DIRS = {
     "node_modules", ".git", ".venv", "venv", "env", "__pycache__", "dist", "build",
@@ -54,7 +64,13 @@ CONN_RE = re.compile(
     r"(\d+|\$[A-Za-z_]\w*|\$\{[^}]{1,60}\}|\"?\s*\+?\s*[A-Za-z_][\w.]*)[^()]{0,400}?)\)",
     re.S)
 CURSOR_ARG_RE = re.compile(r"\b(after|before)\s*:")
-PAGEINFO_RE = re.compile(r"pageInfo\s*\{[^{}]*has(Next|Previous)Page", re.S)
+FIRST_ARG_RE = re.compile(r"\bfirst\s*:")
+LAST_ARG_RE = re.compile(r"\blast\s*:")
+# Directives (`@include(if: $x)`, `@live`) may sit between the arguments and the selection set.
+DIRECTIVES_RE = re.compile(r"(?:\s*@[A-Za-z_]\w*(?:\s*\([^()]*\))?)*\s*")
+# Own-level pageInfo, per paging direction: forward needs hasNextPage, backward hasPreviousPage.
+PAGEINFO_NEXT_RE = re.compile(r"pageInfo\s*\{[^{}]*hasNextPage", re.S)
+PAGEINFO_PREV_RE = re.compile(r"pageInfo\s*\{[^{}]*hasPreviousPage", re.S)
 # Things that look like connections but are not (JS/Python call sites etc).
 NOT_GQL_NAMES = {"print", "console", "log", "range", "len", "dict", "list", "slice", "items",
                  "get", "post", "fetch", "query", "gql", "graphql", "json", "format"}
@@ -142,11 +158,17 @@ def selection_block(text, start):
     return None
 
 
-def direct_pageinfo(block):
-    """pageInfo{hasNextPage} selected at this connection's own level."""
+def direct_pageinfo(block, forward=True, backward=False):
+    """Paging metadata selected at this connection's own level, for its own direction:
+    `first:` (forward) needs pageInfo{hasNextPage}, `last:` (backward) needs
+    pageInfo{hasPreviousPage}. Metadata for the other direction does not count."""
     if block is None:
         return False
-    return bool(PAGEINFO_RE.search(block))
+    if forward and PAGEINFO_NEXT_RE.search(block):
+        return True
+    if backward and PAGEINFO_PREV_RE.search(block):
+        return True
+    return False
 
 
 def scan_text(path, text):
@@ -159,27 +181,36 @@ def scan_text(path, text):
             continue
         # Python/JS kwargs `func(first=..)` use '=' so they never match ':'; JS object
         # literals `fn({first: 10})` contain '{' and are excluded by [^()]. Require
-        # GraphQL-ish context: the next non-space char is '{'.
-        after = m.end()
-        k = after
-        while k < len(text) and text[k] in " \t\r\n":
-            k += 1
+        # GraphQL-ish context: after optional directives the next non-space char is '{'.
+        k = DIRECTIVES_RE.match(text, m.end()).end()
         if k >= len(text) or text[k] != "{":
             continue
         lineno = line_of(text, m.start())
         if CURSOR_ARG_RE.search(args):
             continue
-        block = selection_block(text, after)
-        if direct_pageinfo(block):
+        backward = bool(LAST_ARG_RE.search(args))
+        forward = bool(FIRST_ARG_RE.search(args)) or not backward
+        block = selection_block(text, k)
+        if direct_pageinfo(block, forward, backward):
             continue
         if has_marker(lines, lineno, line_of(text, m.end())):
             continue
+        need = "pageInfo{hasNextPage}" if forward else "pageInfo{hasPreviousPage}"
+        if forward and backward:
+            need = "pageInfo{hasNextPage} / pageInfo{hasPreviousPage}"
+        wrong_way = ""
+        if block is not None and not (forward and backward):
+            other = PAGEINFO_PREV_RE if forward else PAGEINFO_NEXT_RE
+            if other.search(block):
+                wrong_way = (" (the pageInfo selected here pages the other direction and cannot "
+                             "detect overflow for %s:)" % m.group(3))
         findings.append({
             "file": path, "line": lineno, "kind": "graphql-connection",
-            "detail": "%s(%s:%s) has no after: cursor and no pageInfo{hasNextPage} "
+            "detail": "%s(%s:%s) has no %s cursor and no %s%s "
                       "(plain Shopify list fields like fulfillments/refunds/transactions/trackingInfo: "
                       "drop the first: arg to get every item)" % (
-                name, m.group(3), m.group(4).strip()),
+                name, m.group(3), m.group(4).strip(),
+                "after:" if forward else "before:", need, wrong_way),
             "snippet": lines[lineno - 1].strip()[:200] if lineno - 1 < len(lines) else "",
         })
     findings.extend(scan_unread_pageinfo(path, text, lines))
@@ -205,7 +236,11 @@ PAGEINFO_REQ_RE = re.compile(r"pageInfo\s*\{[^{}]*hasNextPage")
 PAGEINFO_READ_RE = re.compile(
     r"\.hasNextPage|\[\s*[\"']hasNextPage[\"']\s*\]|get\(\s*[\"']hasNextPage|"
     r"\.endCursor|\[\s*[\"']endCursor[\"']\s*\]|get\(\s*[\"']endCursor|"
-    r"hasNextPage\s*[:,]\s*(has|next|more|hn)|\bhasNextPage\s*\}\s*=")
+    r"hasNextPage\s*[:,]\s*(has|next|more|hn)|\bhasNextPage\s*\}\s*=|"
+    # Destructuring: `const { hasNextPage, endCursor } = conn.pageInfo`,
+    # `const { pageInfo: { hasNextPage, endCursor } } = data.things`, `({ hasNextPage } = pi)`:
+    # a pattern naming the field whose closing brace(s) are followed by `=` (not `==`).
+    r"\b(?:hasNextPage|endCursor)\b[^{}]*\}(?:\s*,?\s*\})*\s*\)?\s*=(?!=)")
 HELPER_CALL_RE = re.compile(r"(?i)\b\w*(paginat|drain|walk_?pages|all_?pages|each_?page|iter_?pages|"
                             r"fetch_?all|page_?through|follow_?pages|hydrate)\w*\s*\(")
 
@@ -228,13 +263,16 @@ def scan_unread_pageinfo(path, text, lines):
 
 
 def staged_files():
-    out = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+    out = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
                          capture_output=True, text=True, check=False).stdout
     return [f for f in out.splitlines()
             if os.path.splitext(f)[1].lower() in EXTS and os.path.isfile(f)]
 
 
 def main(argv):
+    if "--version" in argv:
+        print(GUARD_VERSION)
+        return 0
     as_json = "--json" in argv
     args = [a for a in argv if not a.startswith("--")]
     root = os.getcwd()
