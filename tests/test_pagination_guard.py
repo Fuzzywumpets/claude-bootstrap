@@ -658,7 +658,7 @@ class Cli(TempDirCase):
         r = run_guard(["--version"], self.tmp)
         self.assertEqual(r.returncode, 0, r.stderr)
         version = r.stdout.strip()
-        self.assertRegex(version, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertRegex(version, r"^\d{4}-\d{2}-\d{2}(\.\d+)?$")
         self.assertEqual(version, guard.GUARD_VERSION)
 
     def test_version_flag_does_not_scan(self):
@@ -897,6 +897,57 @@ class GitStaged(TempDirCase):
         r = run_guard(["--git-staged", "--json"], self.tmp)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertEqual([f["file"] for f in json.loads(r.stdout)], ["a.js"])
+
+
+# --------------------------------------------------------------------------------------
+# DeepReview round 4: cursor-like text inside string values, directives on pageInfo
+# --------------------------------------------------------------------------------------
+class CursorTextInsideStrings(unittest.TestCase):
+    def test_after_text_in_a_string_argument_is_not_a_cursor(self):
+        self.assertEqual(len(conn('const q = `{ things(first: 10, query: "after:foo") { nodes { id } } }`;')), 1)
+
+    def test_before_text_in_a_string_argument_is_not_a_cursor(self):
+        self.assertEqual(len(conn('const q = `{ things(last: 10, query: "created before: 2024") { nodes { id } } }`;')), 1)
+
+    def test_block_string_argument_is_not_a_cursor(self):
+        self.assertEqual(len(conn('const q = `{ things(first: 10, query: """x after: y""") { nodes { id } } }`;')), 1)
+
+    def test_escaped_quote_string_inside_a_js_string_is_not_a_cursor(self):
+        self.assertEqual(len(conn('const q = "{ things(first: 10, query: \\"after:foo\\") { nodes { id } } }";')), 1)
+
+    def test_real_cursor_next_to_a_string_argument_still_satisfies(self):
+        self.assertEqual(conn('const q = `{ things(first: 10, query: "status:open", after: $cursor) { nodes { id } } }`;'), [])
+
+    def test_cursor_argument_after_a_string_containing_a_quote(self):
+        self.assertEqual(conn('const q = `{ things(first: 10, query: "a \\" b", after: $c) { nodes { id } } }`;'), [])
+
+
+class DirectivesOnPageInfo(unittest.TestCase):
+    OK = ("const q = `{ things(first: 10) { nodes { id } pageInfo %s { hasNextPage endCursor } } }`;\n"
+          "const more = res.data.things.pageInfo.hasNextPage;")
+
+    def test_directive_with_arguments_on_pageinfo_satisfies(self):
+        self.assertEqual(scan(self.OK % "@include(if: true)"), [])
+
+    def test_directive_without_arguments_on_pageinfo_satisfies(self):
+        self.assertEqual(scan(self.OK % "@live"), [])
+
+    def test_several_directives_and_a_comment_on_pageinfo(self):
+        self.assertEqual(scan(self.OK % "@a @b(x: 1) # note\n"), [])
+
+    def test_backward_pageinfo_with_directive_satisfies_last(self):
+        self.assertEqual(conn("const q = `{ things(last: 10) { nodes { id } pageInfo @live { hasPreviousPage } } }`;"), [])
+
+    def test_directive_on_pageinfo_with_wrong_direction_is_still_flagged(self):
+        self.assertEqual(len(conn("const q = `{ things(first: 10) { nodes { id } pageInfo @live { hasPreviousPage } } }`;")), 1)
+
+    def test_js_object_literal_after_pageinfo_is_not_a_query(self):
+        src = "assert.deepEqual(state.pageInfo, { hasNextPage: false, endCursor: null });"
+        self.assertEqual(scan(src), [])
+
+    def test_unread_pageinfo_with_directive_is_still_flagged(self):
+        found = unread("const q = `{ things(first: 10) { nodes { id } pageInfo @live { hasNextPage } } }`;")
+        self.assertEqual(len(found), 1)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ import re
 import subprocess
 import sys
 
-GUARD_VERSION = "2026-11-08"   # bump on every behaviour change; `--version` prints it
+GUARD_VERSION = "2026-11-08.2"   # bump on every behaviour change; `--version` prints it
 
 SKIP_DIRS = {
     "node_modules", ".git", ".venv", "venv", "env", "__pycache__", "dist", "build",
@@ -68,6 +68,11 @@ CONN_RE = re.compile(
     r"(\d+|\$[A-Za-z_]\w*|\$\{[^}]{1,60}\}|\"?\s*\+?\s*[A-Za-z_][\w.]*)[^()]{0,400}?)\)",
     re.S)
 CURSOR_ARG_RE = re.compile(r"\b(after|before)\s*:")
+# String values inside the argument list (`query: "after:foo"`) are data, not arguments. They are
+# blanked before looking for cursor names. Block strings, then strings whose quotes are escaped
+# because the whole query sits inside a JS/Python string (`\\"..\\"`), then plain strings.
+STRING_VALUE_RE = re.compile(
+    r'"""(?:[^"\\]|\\.|"(?!""))*"""|\\"(?:[^"\\]|\\(?!")|\\.)*?\\"|"(?:[^"\\\n]|\\.)*"', re.S)
 FIRST_ARG_RE = re.compile(r"\bfirst\s*:")
 LAST_ARG_RE = re.compile(r"\blast\s*:")
 # Between the arguments and the selection set GraphQL allows directives (`@include(if: $x)`,
@@ -75,8 +80,13 @@ LAST_ARG_RE = re.compile(r"\blast\s*:")
 _IGNORED = r"(?:[\s,]|#[^\n]*)*"
 DIRECTIVES_RE = re.compile(_IGNORED + r"(?:@[A-Za-z_]\w*(?:\s*\([^()]*\))?" + _IGNORED + r")*")
 # Own-level pageInfo, per paging direction: forward needs hasNextPage, backward hasPreviousPage.
-PAGEINFO_NEXT_RE = re.compile(r"pageInfo\s*\{[^{}]*hasNextPage", re.S)
-PAGEINFO_PREV_RE = re.compile(r"pageInfo\s*\{[^{}]*hasPreviousPage", re.S)
+# `pageInfo` may carry directives (`pageInfo @include(if: $x) { ... }`) just like any field.
+# No bare commas here (unlike DIRECTIVES_RE): `pageInfo, { hasNextPage: ... }` is a JS object literal.
+_PI_IGNORED = r"(?:\s|#[^\n]*)*"
+_PI_HEAD = (r"pageInfo" + _PI_IGNORED
+            + r"(?:@[A-Za-z_]\w*(?:\s*\([^()]*\))?" + _PI_IGNORED + r")*\{")
+PAGEINFO_NEXT_RE = re.compile(_PI_HEAD + r"[^{}]*hasNextPage", re.S)
+PAGEINFO_PREV_RE = re.compile(_PI_HEAD + r"[^{}]*hasPreviousPage", re.S)
 # Things that look like connections but are not (JS/Python call sites etc).
 NOT_GQL_NAMES = {"print", "console", "log", "range", "len", "dict", "list", "slice", "items",
                  "get", "post", "fetch", "query", "gql", "graphql", "json", "format"}
@@ -197,7 +207,7 @@ def scan_text(path, text):
         if k >= len(text) or text[k] != "{":
             continue
         lineno = line_of(text, m.start())
-        if CURSOR_ARG_RE.search(args):
+        if CURSOR_ARG_RE.search(STRING_VALUE_RE.sub('""', args)):
             continue
         backward = bool(LAST_ARG_RE.search(args))
         forward = bool(FIRST_ARG_RE.search(args)) or not backward
@@ -242,7 +252,7 @@ def scan_text(path, text):
     return findings
 
 
-PAGEINFO_REQ_RE = re.compile(r"pageInfo\s*\{[^{}]*hasNextPage")
+PAGEINFO_REQ_RE = re.compile(_PI_HEAD + r"[^{}]*hasNextPage")
 # Code that actually reads the cursor state (not the query text itself).
 PAGEINFO_READ_RE = re.compile(
     r"\.hasNextPage|\[\s*[\"']hasNextPage[\"']\s*\]|get\(\s*[\"']hasNextPage|"
