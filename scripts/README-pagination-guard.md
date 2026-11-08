@@ -39,11 +39,12 @@ This is a **regex tripwire, not a GraphQL parser**. It catches the common "first
 Known gaps (each can give a missed finding, `m`, or a false finding, `f`):
 
 - `m` Upper-case field names are skipped (so TS/JS types and classes are not read as connections), and a few common names (`items`, `list`, `get`, `query`, ...) are skipped.
-- `m` Cursor-like text inside a GraphQL `#` comment counts as a cursor argument.
+- `m` A commented-out `pageInfo { hasNextPage }` inside a selection set still counts as selected. (`#` comments in the argument list are stripped since 2026-11-08.4, so a commented-out `after:`/`before:` no longer counts as a cursor.)
 - `m` Parentheses inside a string argument hide the connection (arguments are matched without nested parens).
 - `m` `.html` files are not scanned, so inline browser JavaScript is not covered.
 - `f` Aliased paging-state reads (`hasNextPage: more`) in consumer code can produce a false `pageinfo-unread`.
-- `f` A `BOUNDED:` marker is not honoured for the unread-`pageInfo` check in every layout; JS destructured parameters can look like connections; some unusual `pageInfo` selection syntax is rejected.
+- `f` A `BOUNDED:` marker is not honoured for the unread-`pageInfo` check in every layout; JS destructured parameters can look like connections.
+- `f` A comma before pageInfo's selection set (`pageInfo, { hasNextPage }`, legal GraphQL) is rejected on purpose: file-wide text cannot tell it from a JS call `f(pageInfo, { hasNextPage })`, so the guard fails closed. Drop the comma.
 
 When a case matters, add a `BOUNDED:` marker with the reason, or fix the query. Fix the guard here, with a test, and re-sync every vendored copy in the same change.
 
