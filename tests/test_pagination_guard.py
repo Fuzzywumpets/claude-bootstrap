@@ -399,6 +399,28 @@ class CommentsBeforeSelectionSet(unittest.TestCase):
         self.assertEqual(conn("query { things(first: 10) # BOUNDED: top 10\n { nodes { id } } }", "q.graphql"), [])
 
 
+class CommasBeforeSelectionSet(unittest.TestCase):
+    """Commas are ignored tokens in GraphQL, like whitespace and comments."""
+
+    def test_comma_between_args_and_selection_set(self):
+        found = conn("query { things(first: 10), { nodes { id } } }", "q.graphql")
+        self.assertEqual([f["line"] for f in found], [1])
+
+    def test_comma_before_a_directive(self):
+        self.assertEqual(len(conn("query { things(first: 10), @include(if: $x) { nodes { id } } }", "q.graphql")), 1)
+
+    def test_commas_comments_and_directives_mixed(self):
+        src = "query { things(first: 10) , # c\n , @include(if: $x) , @skip(if: $y)\n , { nodes { id } } }"
+        self.assertEqual(len(conn(src, "q.graphql")), 1)
+
+    def test_comma_with_own_level_pageinfo_or_cursor_is_fine(self):
+        self.assertEqual(conn("query { things(first: 10), { nodes { id } pageInfo { hasNextPage } } }", "q.graphql"), [])
+        self.assertEqual(conn("query { things(first: 10, after: $c), { nodes { id } } }", "q.graphql"), [])
+
+    def test_comma_then_non_selection_is_not_a_connection(self):
+        self.assertEqual(conn("rows = [load(first: 10), other]\n", "x.js"), [])
+
+
 # --------------------------------------------------------------------------------------
 # Defect (b): backward pagination metadata must not satisfy a forward connection
 # --------------------------------------------------------------------------------------
@@ -801,16 +823,26 @@ class GitStaged(TempDirCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertEqual(sorted(f["file"] for f in json.loads(r.stdout)), sorted([u"caf\u00e9.js", "with space.js"]))
 
-    def test_staged_scan_from_a_subdirectory_uses_cwd_relative_names(self):
+    def test_staged_scan_from_a_subdirectory_uses_repo_relative_names(self):
         self.init_repo()
         self.write("sub/inner.js", UNBOUNDED_JS)
         self.write("outer.js", UNBOUNDED_JS)
         self.git("add", "--all")
         r = run_guard(["--git-staged", "--json"], os.path.join(self.tmp, "sub"))
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
-        self.assertEqual(sorted(f["file"] for f in json.loads(r.stdout)),
-                         sorted(["inner.js", os.path.join("..", "outer.js")]))
+        self.assertEqual(sorted(f["file"] for f in json.loads(r.stdout)), ["outer.js", "sub/inner.js"])
 
+    def test_staged_scan_from_a_subdirectory_honours_the_repo_root_ignore_file(self):
+        self.init_repo()
+        self.write("sub/inner.js", UNBOUNDED_JS)
+        self.write("sub/other.js", UNBOUNDED_JS)
+        self.write(".pagination-guard-ignore", "sub/inner.js\n")
+        self.git("add", "--all")
+        from_root = run_guard(["--git-staged", "--json"], self.tmp)
+        from_sub = run_guard(["--git-staged", "--json"], os.path.join(self.tmp, "sub"))
+        self.assertEqual([f["file"] for f in json.loads(from_root.stdout)], ["sub/other.js"])
+        self.assertEqual(from_sub.stdout, from_root.stdout)
+        self.assertEqual(from_sub.returncode, 1)
 
     def test_git_failure_is_an_error_not_a_clean_scan(self):
         # not a git repository (GIT_CEILING_DIRECTORIES stops git from finding one in a parent)
