@@ -35,8 +35,8 @@ Usage:
   pagination_guard.py --json              machine-readable findings
   pagination_guard.py --version           print GUARD_VERSION and exit
 Exit 1 when any unmarked finding exists; exit 2 when git cannot be queried (--git-staged).
---git-staged scans the staged (index) content and the staged .pagination-guard-ignore; path
-arguments are ignored in that mode.
+--git-staged scans the staged (index) content and the staged repo-root .pagination-guard-ignore,
+reporting repo-root-relative names from any directory; path arguments are ignored in that mode.
 
 SYNC: pagination_guard - canonical copy is Fuzzywumpets/claude-bootstrap scripts/pagination_guard.py;
 vendored copies live in each repo at scripts/pagination_guard.py (or tools/). Update all
@@ -71,8 +71,8 @@ CURSOR_ARG_RE = re.compile(r"\b(after|before)\s*:")
 FIRST_ARG_RE = re.compile(r"\bfirst\s*:")
 LAST_ARG_RE = re.compile(r"\blast\s*:")
 # Between the arguments and the selection set GraphQL allows directives (`@include(if: $x)`,
-# `@live`) and ignored tokens: whitespace and `# comments` up to the end of the line.
-_IGNORED = r"(?:\s|#[^\n]*)*"
+# `@live`) and ignored tokens: whitespace, commas and `# comments` up to the end of the line.
+_IGNORED = r"(?:[\s,]|#[^\n]*)*"
 DIRECTIVES_RE = re.compile(_IGNORED + r"(?:@[A-Za-z_]\w*(?:\s*\([^()]*\))?" + _IGNORED + r")*")
 # Own-level pageInfo, per paging direction: forward needs hasNextPage, backward hasPreviousPage.
 PAGEINFO_NEXT_RE = re.compile(r"pageInfo\s*\{[^{}]*hasNextPage", re.S)
@@ -316,12 +316,12 @@ def staged_text(name):
     return _universal_newlines(data.decode("utf-8", errors="replace"))
 
 
-def staged_ignores(root, top):
-    """.pagination-guard-ignore as staged (an unstaged one is not part of the commit)."""
-    name = os.path.relpath(os.path.join(root, IGNORE_FILE), top).replace(os.sep, "/")
-    if not _git(["--literal-pathspecs", "ls-files", "-z", "--cached", "--", name]):
+def staged_ignores(top):
+    """The repo-root .pagination-guard-ignore as staged (an unstaged one is not part of the commit).
+    Pathspecs are cwd-relative, hence -C <top>; `:0:` blob names are always repo-root-relative."""
+    if not _git(["-C", top, "--literal-pathspecs", "ls-files", "-z", "--cached", "--", IGNORE_FILE]):
         return []
-    return parse_ignores(staged_text(name) or "")
+    return parse_ignores(staged_text(IGNORE_FILE) or "")
 
 
 def main(argv):
@@ -341,21 +341,19 @@ def run(argv):
     root = os.getcwd()
     staged = "--git-staged" in argv
     if staged:
-        # (name in the index, path used for display/ignore matching relative to the cwd);
-        # path arguments are ignored in this mode
-        top = git_toplevel()
-        ignores = staged_ignores(root, top)
-        files = [(n, os.path.join(top, n)) for n in staged_files()]
+        # Staged files are identified, ignored and reported by repo-root-relative name, whatever the
+        # cwd is; the ignore file is the staged repo-root one. Path arguments are ignored.
+        ignores = staged_ignores(git_toplevel())    # exit 2 here when this is not a git work tree
+        files = [(n, n) for n in staged_files()]
     else:
         ignores = load_ignores(root)
-        files = [(f, f) for f in iter_files(args or ["."])]
+        files = [(f, os.path.relpath(f, root)) for f in iter_files(args or ["."])]
     findings = []
-    for name, f in files:
-        rel = os.path.relpath(f, root)
+    for f, rel in files:
         if ignored(rel, ignores):
             continue
         if staged:
-            text = staged_text(name)      # scan what will be committed, not the working tree
+            text = staged_text(f)         # scan what will be committed, not the working tree
             if text is None:
                 continue
         else:
