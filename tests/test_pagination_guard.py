@@ -47,8 +47,10 @@ def clean_env():
     return env
 
 
-def run_guard(args, cwd):
-    return subprocess.run([sys.executable, SCRIPT] + list(args), cwd=cwd, env=clean_env(),
+def run_guard(args, cwd, env_extra=None):
+    env = clean_env()
+    env.update(env_extra or {})
+    return subprocess.run([sys.executable, SCRIPT] + list(args), cwd=cwd, env=env,
                           capture_output=True, text=True)
 
 
@@ -808,6 +810,43 @@ class GitStaged(TempDirCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertEqual(sorted(f["file"] for f in json.loads(r.stdout)),
                          sorted(["inner.js", os.path.join("..", "outer.js")]))
+
+
+    def test_git_failure_is_an_error_not_a_clean_scan(self):
+        # not a git repository (GIT_CEILING_DIRECTORIES stops git from finding one in a parent)
+        r = run_guard(["--git-staged", "--json"], self.tmp,
+                      env_extra={"GIT_CEILING_DIRECTORIES": os.path.dirname(self.tmp)})
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.strip(), "")
+        self.assertIn("git", r.stderr)
+
+    def test_unstaged_ignore_file_does_not_exempt_staged_code(self):
+        self.init_repo()
+        self.write("a.js", UNBOUNDED_JS)
+        self.git("add", "a.js")
+        self.write(".pagination-guard-ignore", "a.js\n")       # not staged: will not be committed
+        r = run_guard(["--git-staged", "--json"], self.tmp)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual([f["file"] for f in json.loads(r.stdout)], ["a.js"])
+
+    def test_staged_ignore_file_exempts_staged_code(self):
+        self.init_repo()
+        self.write("a.js", UNBOUNDED_JS)
+        self.write("b.js", UNBOUNDED_JS)
+        self.write(".pagination-guard-ignore", "# reasons\na.js\n")
+        self.git("add", "a.js", "b.js", ".pagination-guard-ignore")
+        r = run_guard(["--git-staged", "--json"], self.tmp)
+        self.assertEqual([f["file"] for f in json.loads(r.stdout)], ["b.js"])
+
+    def test_staged_ignore_file_is_read_from_the_index(self):
+        self.init_repo()
+        self.write("a.js", UNBOUNDED_JS)
+        self.write(".pagination-guard-ignore", "a.js\n")
+        self.git("add", "a.js", ".pagination-guard-ignore")
+        self.write(".pagination-guard-ignore", "# emptied but not staged\n")
+        r = run_guard(["--git-staged", "--json"], self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(r.stdout), [])
 
 
 if __name__ == "__main__":
