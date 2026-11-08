@@ -990,5 +990,82 @@ class AliasesAreNotFields(unittest.TestCase):
         self.assertEqual(conn(src), [])
 
 
+
+# --------------------------------------------------------------------------------------
+# DeepReview (tools-mcp #5, 2026-11-08): commented arguments; the comma-before-pageInfo rule
+# --------------------------------------------------------------------------------------
+class CommentedArgumentsAreNotArguments(unittest.TestCase):
+    """`# comments` inside the argument list are ignored tokens, never cursor or direction arguments."""
+
+    def test_commented_after_is_not_a_cursor(self):
+        # the exact DeepReview case: the cursor was commented out, the query reads page one only
+        found = conn("query { orders(first: 100 # after: $cursor\n) { nodes { id } } }", "q.graphql")
+        self.assertEqual([f["line"] for f in found], [1])
+
+    def test_commented_before_is_not_a_cursor_for_last(self):
+        self.assertEqual(len(conn("query { orders(last: 5 # before: $c\n) { nodes { id } } }", "q.graphql")), 1)
+
+    def test_commented_cursor_in_a_one_line_js_string(self):
+        # inside a JS string the GraphQL line ends at the `\n` escape
+        self.assertEqual(len(conn('const q = "query { orders(first: 100 # after: $c\\n) { nodes { id } } }";')), 1)
+
+    def test_comment_ends_at_a_newline_escape_so_the_real_cursor_counts(self):
+        self.assertEqual(conn('const q = "query { orders(first: 100 # page\\n after: $c) { nodes { id } } }";'), [])
+
+    def test_real_cursor_after_a_comment_on_its_own_line(self):
+        src = "query {\n  orders(\n    first: 10, # page size\n    after: $c\n  ) { nodes { id } }\n}"
+        self.assertEqual(conn(src, "q.graphql"), [])
+
+    def test_hash_inside_a_string_value_is_not_a_comment(self):
+        self.assertEqual(conn('const q = `{ orders(first: 10, query: "tag:#x", after: $c) { nodes { id } } }`;'), [])
+
+    def test_block_string_quotes_inside_a_comment_do_not_hide_the_cursor(self):
+        src = 'query { orders(first: 10 # no """ here\n after: $c, query: """x""") { nodes { id } } }'
+        self.assertEqual(conn(src, "q.graphql"), [])
+
+    def test_js_private_field_is_not_a_comment(self):
+        self.assertEqual(conn("const q = `{ orders(first: ${this.#n}, after: $c) { nodes { id } } }`;"), [])
+
+    def test_ruby_interpolation_is_not_a_comment(self):
+        self.assertEqual(conn('q = "{ orders(first: 10, query: #{q}, after: $c) { nodes { id } } }"\n', "x.rb"), [])
+
+    def test_newline_escape_text_inside_a_native_graphql_comment_does_not_end_it(self):
+        # DeepReview round 2: in a .graphql/.gql document `\n` is just comment text
+        src = "query { orders(first: 100 # note\\n after: $c\n) { nodes { id } } }"
+        self.assertEqual(len(conn(src, "q.graphql")), 1)
+        self.assertEqual(len(conn(src, "q.gql")), 1)
+        self.assertEqual(conn(src, "q.js"), [])   # host code: the escape ends the GraphQL line
+
+    def test_hash_brace_in_a_native_graphql_file_is_a_comment(self):
+        self.assertEqual(len(conn("query { orders(first: 10 #{after: $c}\n) { nodes { id } } }", "q.graphql")), 1)
+
+    def test_commented_last_does_not_change_the_direction(self):
+        # forward connection whose only metadata is backward: a commented `last:` must not make it "both ways"
+        src = "query { orders(first: 10 # last: 5\n) { nodes { id } pageInfo { hasPreviousPage } } }"
+        self.assertEqual(len(conn(src, "q.graphql")), 1)
+
+
+class CommaBeforePageInfoSelectionFailsClosed(unittest.TestCase):
+    """Documented rule (KNOWN LIMITS): `pageInfo, { ... }` is not read as a pageInfo selection."""
+
+    def test_comma_before_pageinfo_selection_is_a_finding(self):
+        src = ("query { orders(first: 10) { nodes { id } pageInfo, { hasNextPage } } }\n"
+               "if (result.orders.pageInfo.hasNextPage) throw Error('overflow');")
+        found = conn(src)
+        self.assertEqual([f["line"] for f in found], [1])
+
+    def test_without_the_comma_the_same_query_passes(self):
+        src = ("query { orders(first: 10) { nodes { id } pageInfo { hasNextPage } } }\n"
+               "if (result.orders.pageInfo.hasNextPage) throw Error('overflow');")
+        self.assertEqual(scan(src), [])
+
+    def test_js_call_with_shorthand_object_is_not_a_pageinfo_request(self):
+        # the reason for the rule: with commas allowed this JS would read as an unread pageInfo request
+        self.assertEqual(scan("assert.deepEqual(pageInfo, { hasNextPage, endCursor });\n"), [])
+
+    def test_version_was_bumped(self):
+        self.assertEqual(guard.GUARD_VERSION, "2026-11-08.4")
+
+
 if __name__ == "__main__":
     unittest.main()

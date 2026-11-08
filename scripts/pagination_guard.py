@@ -20,7 +20,12 @@ KNOWN LIMITS (deliberate; this is a tripwire, not a proof -- review still owns c
   * helper-call names (paginate/drain/walk/...) count as "pageInfo consumed";
   * queries assembled from string constants are only seen where the literal text is present;
   * `first:` + `before:` (or `last:` + `after:`) is accepted as "has a cursor" without checking the direction;
-  * a commented-out `pageInfo { hasNextPage }` inside a selection set still counts as selected;
+  * a commented-out `pageInfo { hasNextPage }` inside a selection set still counts as selected
+    (`# comments` are stripped from the ARGUMENT list only, so a commented `after:` is not a cursor;
+    in host-language code a comment ends at a newline or a `\n`/`\r` escape, in .graphql/.gql at a newline);
+  * `pageInfo, { hasNextPage }` (a comma before pageInfo's selection set, legal GraphQL) is rejected on
+    purpose: file-wide text cannot tell it from a JS call `f(pageInfo, { hasNextPage })`, so the guard
+    fails closed (a false finding; drop the comma) rather than read JS objects as satisfied queries;
   * "pageInfo is read" is a text match: `.hasNextPage`, `["hasNextPage"]`, `.get("hasNextPage")` and a
     destructuring pattern naming hasNextPage/endCursor followed by `=` all count; only the forward
     (`hasNextPage`) request is checked for being read.
@@ -49,7 +54,7 @@ import re
 import subprocess
 import sys
 
-GUARD_VERSION = "2026-11-08.3"   # bump on every behaviour change; `--version` prints it
+GUARD_VERSION = "2026-11-08.4"   # bump on every behaviour change; `--version` prints it
 
 SKIP_DIRS = {
     "node_modules", ".git", ".venv", "venv", "env", "__pycache__", "dist", "build",
@@ -73,14 +78,27 @@ CURSOR_ARG_RE = re.compile(r"\b(after|before)\s*:")
 # because the whole query sits inside a JS/Python string (`\\"..\\"`), then plain strings.
 STRING_VALUE_RE = re.compile(
     r'"""(?:[^"\\]|\\.|"(?!""))*"""|\\"(?:[^"\\]|\\(?!")|\\.)*?\\"|"(?:[^"\\\n]|\\.)*"', re.S)
+# GraphQL `# comments` run to the end of the line. In a native .graphql/.gql file that is the only
+# rule. In host-language code (JS/Python/Ruby/... strings) a query on one line ends its GraphQL line at
+# a `\n`/`\r` escape, and `this.#field` (JS private field) / `#{expr}` (Ruby interpolation) are not
+# comments.
+COMMENT_NATIVE_RE = re.compile(r"#[^\n]*")
+COMMENT_HOST_RE = re.compile(r"(?<!\.)#(?!\{)(?:(?!\\[nr])[^\n])*")
+NATIVE_GRAPHQL_EXTS = {".graphql", ".gql"}
+# One left-to-right pass: whichever starts first wins, so `"#tag"` stays a string and a quote inside a
+# comment never opens one.
+_STRING_OR_COMMENT_NATIVE_RE = re.compile("(%s)|%s" % (STRING_VALUE_RE.pattern, COMMENT_NATIVE_RE.pattern), re.S)
+_STRING_OR_COMMENT_HOST_RE = re.compile("(%s)|%s" % (STRING_VALUE_RE.pattern, COMMENT_HOST_RE.pattern), re.S)
 # Nested input objects / lists (`filter: { after: "x" }`) hold properties, not connection arguments.
 _NESTED_RE = re.compile(r"\{[^{}]*\}|\[[^\[\]]*\]")
 
 
-def top_level_args(args):
-    """Argument text with string values and nested input objects/lists blanked out, so only the
-    connection's own arguments (first/last/after/before) are visible."""
-    s = STRING_VALUE_RE.sub('""', args)
+def top_level_args(args, native=False):
+    """Argument text with string values, `# comments` and nested input objects/lists blanked out, so
+    only the connection's own arguments (first/last/after/before) are visible. `native`: the text is
+    a .graphql/.gql document, not a query inside host-language code."""
+    rx = _STRING_OR_COMMENT_NATIVE_RE if native else _STRING_OR_COMMENT_HOST_RE
+    s = rx.sub(lambda m: '""' if m.group(1) is not None else "", args)
     prev = None
     while prev != s:
         prev, s = s, _NESTED_RE.sub("", s)
@@ -210,6 +228,7 @@ def direct_pageinfo(block, forward=True, backward=False):
 def scan_text(path, text):
     findings = []
     lines = text.splitlines()
+    native = os.path.splitext(path)[1].lower() in NATIVE_GRAPHQL_EXTS
     for m in CONN_RE.finditer(text):
         name, args = m.group(1), m.group(2)
         if name in NOT_GQL_NAMES or name[0].isupper():
@@ -222,7 +241,7 @@ def scan_text(path, text):
         if k >= len(text) or text[k] != "{":
             continue
         lineno = line_of(text, m.start())
-        top = top_level_args(args)
+        top = top_level_args(args, native)
         if CURSOR_ARG_RE.search(top):
             continue
         backward = bool(LAST_ARG_RE.search(top))
