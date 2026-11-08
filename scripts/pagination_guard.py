@@ -49,7 +49,7 @@ import re
 import subprocess
 import sys
 
-GUARD_VERSION = "2026-11-08.2"   # bump on every behaviour change; `--version` prints it
+GUARD_VERSION = "2026-11-08.3"   # bump on every behaviour change; `--version` prints it
 
 SKIP_DIRS = {
     "node_modules", ".git", ".venv", "venv", "env", "__pycache__", "dist", "build",
@@ -73,6 +73,20 @@ CURSOR_ARG_RE = re.compile(r"\b(after|before)\s*:")
 # because the whole query sits inside a JS/Python string (`\\"..\\"`), then plain strings.
 STRING_VALUE_RE = re.compile(
     r'"""(?:[^"\\]|\\.|"(?!""))*"""|\\"(?:[^"\\]|\\(?!")|\\.)*?\\"|"(?:[^"\\\n]|\\.)*"', re.S)
+# Nested input objects / lists (`filter: { after: "x" }`) hold properties, not connection arguments.
+_NESTED_RE = re.compile(r"\{[^{}]*\}|\[[^\[\]]*\]")
+
+
+def top_level_args(args):
+    """Argument text with string values and nested input objects/lists blanked out, so only the
+    connection's own arguments (first/last/after/before) are visible."""
+    s = STRING_VALUE_RE.sub('""', args)
+    prev = None
+    while prev != s:
+        prev, s = s, _NESTED_RE.sub("", s)
+    return s
+
+
 FIRST_ARG_RE = re.compile(r"\bfirst\s*:")
 LAST_ARG_RE = re.compile(r"\blast\s*:")
 # Between the arguments and the selection set GraphQL allows directives (`@include(if: $x)`,
@@ -85,8 +99,9 @@ DIRECTIVES_RE = re.compile(_IGNORED + r"(?:@[A-Za-z_]\w*(?:\s*\([^()]*\))?" + _I
 _PI_IGNORED = r"(?:\s|#[^\n]*)*"
 _PI_HEAD = (r"pageInfo" + _PI_IGNORED
             + r"(?:@[A-Za-z_]\w*(?:\s*\([^()]*\))?" + _PI_IGNORED + r")*\{")
-PAGEINFO_NEXT_RE = re.compile(_PI_HEAD + r"[^{}]*hasNextPage", re.S)
-PAGEINFO_PREV_RE = re.compile(_PI_HEAD + r"[^{}]*hasPreviousPage", re.S)
+# The field must be selected under its own name: `hasNextPage: hasPreviousPage` is an alias.
+PAGEINFO_NEXT_RE = re.compile(_PI_HEAD + r"[^{}]*\bhasNextPage\b(?!\s*:)", re.S)
+PAGEINFO_PREV_RE = re.compile(_PI_HEAD + r"[^{}]*\bhasPreviousPage\b(?!\s*:)", re.S)
 # Things that look like connections but are not (JS/Python call sites etc).
 NOT_GQL_NAMES = {"print", "console", "log", "range", "len", "dict", "list", "slice", "items",
                  "get", "post", "fetch", "query", "gql", "graphql", "json", "format"}
@@ -207,10 +222,11 @@ def scan_text(path, text):
         if k >= len(text) or text[k] != "{":
             continue
         lineno = line_of(text, m.start())
-        if CURSOR_ARG_RE.search(STRING_VALUE_RE.sub('""', args)):
+        top = top_level_args(args)
+        if CURSOR_ARG_RE.search(top):
             continue
-        backward = bool(LAST_ARG_RE.search(args))
-        forward = bool(FIRST_ARG_RE.search(args)) or not backward
+        backward = bool(LAST_ARG_RE.search(top))
+        forward = bool(FIRST_ARG_RE.search(top)) or not backward
         block = selection_block(text, k)
         if direct_pageinfo(block, forward, backward):
             continue
@@ -252,12 +268,12 @@ def scan_text(path, text):
     return findings
 
 
-PAGEINFO_REQ_RE = re.compile(_PI_HEAD + r"[^{}]*hasNextPage")
+PAGEINFO_REQ_RE = re.compile(_PI_HEAD + r"[^{}]*\bhasNextPage\b(?!\s*:)")
 # Code that actually reads the cursor state (not the query text itself).
 PAGEINFO_READ_RE = re.compile(
     r"\.hasNextPage|\[\s*[\"']hasNextPage[\"']\s*\]|get\(\s*[\"']hasNextPage|"
     r"\.endCursor|\[\s*[\"']endCursor[\"']\s*\]|get\(\s*[\"']endCursor|"
-    r"hasNextPage\s*[:,]\s*(has|next|more|hn)|\bhasNextPage\s*\}\s*=|"
+    r"hasNextPage\s*[:,]\s*(?!hasPreviousPage|hasNextPage|startCursor|endCursor)(has|next|more|hn)|\bhasNextPage\s*\}\s*=|"
     # Destructuring: `const { hasNextPage, endCursor } = conn.pageInfo`,
     # `const { pageInfo: { hasNextPage, endCursor } } = data.things`, `({ hasNextPage } = pi)`:
     # a pattern naming the field whose closing brace(s) are followed by `=` (not `==`).

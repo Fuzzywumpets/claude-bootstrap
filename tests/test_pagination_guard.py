@@ -950,5 +950,45 @@ class DirectivesOnPageInfo(unittest.TestCase):
         self.assertEqual(len(found), 1)
 
 
+# --------------------------------------------------------------------------------------
+# DeepReview round 5: direction from string contents, nested input properties, aliases
+# --------------------------------------------------------------------------------------
+class ArgumentsAreReadAtTopLevelOnly(unittest.TestCase):
+    def test_first_inside_a_string_does_not_change_the_direction(self):
+        src = ('const q = `{ things(last: 10, query: "first:foo") { nodes { id } '
+               'pageInfo { hasNextPage } } }`;\nconst more = data.things.pageInfo.hasNextPage;')
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_nested_after_in_an_input_object_is_not_a_cursor(self):
+        self.assertEqual(len(conn('const q = `{ things(first: 10, filter: { after: "2024-01-01" }) { nodes { id } } }`;')), 1)
+
+    def test_nested_before_in_a_list_of_inputs_is_not_a_cursor(self):
+        self.assertEqual(len(conn('const q = `{ things(last: 10, filters: [{ before: 3 }]) { nodes { id } } }`;')), 1)
+
+    def test_top_level_cursor_next_to_a_nested_input_still_satisfies(self):
+        self.assertEqual(conn('const q = `{ things(first: 10, filter: { status: "open" }, after: $c) { nodes { id } } }`;'), [])
+
+
+class AliasesAreNotFields(unittest.TestCase):
+    TAIL = "\nconst more = result.things.pageInfo.hasNextPage;"
+
+    def test_alias_named_hasnextpage_for_haspreviouspage_does_not_satisfy_forward(self):
+        src = "const q = `{ things(first: 10) { nodes { id } pageInfo { hasNextPage: hasPreviousPage } } }`;" + self.TAIL
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_alias_does_not_suppress_the_unread_warning(self):
+        src = "const q = `{ things(first: 10) { nodes { id } pageInfo { hasNextPage: hasPreviousPage } } }`;"
+        self.assertEqual(len(conn(src)), 1)
+        self.assertEqual(len(unread("const q = `{ x { pageInfo { hasNextPage: hasPreviousPage } } }`;")), 0)  # not a hasNextPage request at all
+
+    def test_real_field_under_an_alias_still_satisfies(self):
+        src = "const q = `{ things(first: 10) { nodes { id } pageInfo { more: hasNextPage } } }`;" + self.TAIL.replace("hasNextPage", "more")
+        self.assertEqual(conn(src), [])
+
+    def test_alias_for_the_right_field_next_to_the_real_one(self):
+        src = "const q = `{ things(first: 10) { nodes { id } pageInfo { hasNextPage hasPreviousPage: hasNextPage } } }`;" + self.TAIL
+        self.assertEqual(conn(src), [])
+
+
 if __name__ == "__main__":
     unittest.main()
