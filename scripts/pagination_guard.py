@@ -22,7 +22,9 @@ KNOWN LIMITS (deliberate; this is a tripwire, not a proof -- review still owns c
   * `first:` + `before:` (or `last:` + `after:`) is accepted as "has a cursor" without checking the direction;
   * a commented-out `pageInfo { hasNextPage }` inside a selection set still counts as selected
     (`# comments` are stripped from the ARGUMENT list only, so a commented `after:` is not a cursor;
-    in host-language code a comment ends at a newline or a `\n`/`\r` escape, in .graphql/.gql at a newline);
+    in host-language code a comment ends at a newline or a `\n`/`\r` escape, in .graphql/.gql at a newline;
+    the same rule applies to comments before a selection set, where host-code `\n`/`\r`/`\t` escapes count
+    as whitespace);
   * `pageInfo, { hasNextPage }` (a comma before pageInfo's selection set, legal GraphQL) is rejected on
     purpose: file-wide text cannot tell it from a JS call `f(pageInfo, { hasNextPage })`, so the guard
     fails closed (a false finding; drop the comma) rather than read JS objects as satisfied queries;
@@ -54,7 +56,7 @@ import re
 import subprocess
 import sys
 
-GUARD_VERSION = "2026-11-08.4"   # bump on every behaviour change; `--version` prints it
+GUARD_VERSION = "2026-11-09.1"   # bump on every behaviour change; `--version` prints it
 
 SKIP_DIRS = {
     "node_modules", ".git", ".venv", "venv", "env", "__pycache__", "dist", "build",
@@ -78,27 +80,42 @@ CURSOR_ARG_RE = re.compile(r"\b(after|before)\s*:")
 # because the whole query sits inside a JS/Python string (`\\"..\\"`), then plain strings.
 STRING_VALUE_RE = re.compile(
     r'"""(?:[^"\\]|\\.|"(?!""))*"""|\\"(?:[^"\\]|\\(?!")|\\.)*?\\"|"(?:[^"\\\n]|\\.)*"', re.S)
-# GraphQL `# comments` run to the end of the line. In a native .graphql/.gql file that is the only
-# rule. In host-language code (JS/Python/Ruby/... strings) a query on one line ends its GraphQL line at
-# a `\n`/`\r` escape, and `this.#field` (JS private field) / `#{expr}` (Ruby interpolation) are not
-# comments.
-COMMENT_NATIVE_RE = re.compile(r"#[^\n]*")
-COMMENT_HOST_RE = re.compile(r"(?<!\.)#(?!\{)(?:(?!\\[nr])[^\n])*")
+# How `#` and backslash escapes read depends on where the GraphQL text sits (source_mode()):
+#   "native": a .graphql/.gql document. A `# comment` runs to the newline; `\n` is just text.
+#   "host":   a query inside JS/TS/Python/... code. On one line inside a string, the GraphQL line ends at a
+#             `\n`/`\r` escape, and `\n`/`\r`/`\t` escapes are GraphQL whitespace. `this.#field` (a JS
+#             private field) is not a comment.
+#   "ruby":   like "host", and `#{expr}` is Ruby string interpolation, not a comment.
+# Each comment must run to its line end (the lookahead): backtracking may never end it early, before a
+# `{` or a cursor name later on the same line.
+MODES = ("native", "host", "ruby")
 NATIVE_GRAPHQL_EXTS = {".graphql", ".gql"}
+
+
+def source_mode(path):
+    ext = os.path.splitext(path)[1].lower()
+    return "native" if ext in NATIVE_GRAPHQL_EXTS else "ruby" if ext == ".rb" else "host"
+
+
+def _comment(mode):
+    if mode == "native":
+        return r"#[^\n]*(?=\n|\Z)"
+    head = r"(?<!\.)#(?!\{)" if mode == "ruby" else r"(?<!\.)#"
+    return head + r"(?:(?!\\[nr])[^\n])*(?=\n|\\[nr]|\Z)"
+
+
+COMMENT_RE = {m: re.compile(_comment(m)) for m in MODES}
 # One left-to-right pass: whichever starts first wins, so `"#tag"` stays a string and a quote inside a
 # comment never opens one.
-_STRING_OR_COMMENT_NATIVE_RE = re.compile("(%s)|%s" % (STRING_VALUE_RE.pattern, COMMENT_NATIVE_RE.pattern), re.S)
-_STRING_OR_COMMENT_HOST_RE = re.compile("(%s)|%s" % (STRING_VALUE_RE.pattern, COMMENT_HOST_RE.pattern), re.S)
+_STRING_OR_COMMENT_RE = {m: re.compile("(%s)|%s" % (STRING_VALUE_RE.pattern, _comment(m)), re.S) for m in MODES}
 # Nested input objects / lists (`filter: { after: "x" }`) hold properties, not connection arguments.
 _NESTED_RE = re.compile(r"\{[^{}]*\}|\[[^\[\]]*\]")
 
 
-def top_level_args(args, native=False):
+def top_level_args(args, mode="host"):
     """Argument text with string values, `# comments` and nested input objects/lists blanked out, so
-    only the connection's own arguments (first/last/after/before) are visible. `native`: the text is
-    a .graphql/.gql document, not a query inside host-language code."""
-    rx = _STRING_OR_COMMENT_NATIVE_RE if native else _STRING_OR_COMMENT_HOST_RE
-    s = rx.sub(lambda m: '""' if m.group(1) is not None else "", args)
+    only the connection's own arguments (first/last/after/before) are visible."""
+    s = _STRING_OR_COMMENT_RE[mode].sub(lambda m: '""' if m.group(1) is not None else "", args)
     prev = None
     while prev != s:
         prev, s = s, _NESTED_RE.sub("", s)
@@ -107,19 +124,48 @@ def top_level_args(args, native=False):
 
 FIRST_ARG_RE = re.compile(r"\bfirst\s*:")
 LAST_ARG_RE = re.compile(r"\blast\s*:")
+# Escapes that a one-line query string in host code uses for GraphQL whitespace.
+_ESCAPED_WS = r"\\[nrt]"
+
+
+def _ws(mode, commas=False):
+    """One ignored whitespace token (no comments)."""
+    ws = r"[\s,]" if commas else r"\s"
+    return ws if mode == "native" else r"(?:%s|%s)" % (ws, _ESCAPED_WS)
+
+
+def _ignored(mode, commas):
+    """Ignored tokens between a field and its selection set: whitespace, `# comments`, host escapes."""
+    return r"(?:%s|%s)*" % (_ws(mode, commas), _comment(mode))
+
+
+def _name_start(mode):
+    """A field name starts here: no word character before it, except the letter of a host `\n` escape."""
+    return r"(?<!\w)" if mode == "native" else r"(?:(?<!\w)|(?<=\\[nrt]))"
+
+
+def _directives(mode, ign):
+    return r"(?:@[A-Za-z_]\w*(?:%s*\([^()]*\))?" % _ws(mode) + ign + r")*"
+
+
 # Between the arguments and the selection set GraphQL allows directives (`@include(if: $x)`,
-# `@live`) and ignored tokens: whitespace, commas and `# comments` up to the end of the line.
-_IGNORED = r"(?:[\s,]|#[^\n]*)*"
-DIRECTIVES_RE = re.compile(_IGNORED + r"(?:@[A-Za-z_]\w*(?:\s*\([^()]*\))?" + _IGNORED + r")*")
+# `@live`) and ignored tokens. Keyed by source mode.
+DIRECTIVES_RE = {m: re.compile(_ignored(m, True) + _directives(m, _ignored(m, True))) for m in MODES}
 # Own-level pageInfo, per paging direction: forward needs hasNextPage, backward hasPreviousPage.
-# `pageInfo` may carry directives (`pageInfo @include(if: $x) { ... }`) just like any field.
+# `pageInfo` must be the whole field name (`custompageInfo` is another field) and may carry directives
+# (`pageInfo @include(if: $x) { ... }`) just like any field.
 # No bare commas here (unlike DIRECTIVES_RE): `pageInfo, { hasNextPage: ... }` is a JS object literal.
-_PI_IGNORED = r"(?:\s|#[^\n]*)*"
-_PI_HEAD = (r"pageInfo" + _PI_IGNORED
-            + r"(?:@[A-Za-z_]\w*(?:\s*\([^()]*\))?" + _PI_IGNORED + r")*\{")
-# The field must be selected under its own name: `hasNextPage: hasPreviousPage` is an alias.
-PAGEINFO_NEXT_RE = re.compile(_PI_HEAD + r"[^{}]*\bhasNextPage\b(?!\s*:)", re.S)
-PAGEINFO_PREV_RE = re.compile(_PI_HEAD + r"[^{}]*\bhasPreviousPage\b(?!\s*:)", re.S)
+_PI_HEAD = {m: _name_start(m) + r"pageInfo" + _ignored(m, False) + _directives(m, _ignored(m, False)) + r"\{"
+            for m in MODES}
+
+
+def _pi_field(mode, field):
+    # The field must be selected under its own name: `hasNextPage: hasPreviousPage` is an alias.
+    return (_PI_HEAD[mode] + r"[^{}]*" + _name_start(mode) + field + r"\b(?!%s*:)" % _ws(mode))
+
+
+PAGEINFO_NEXT_RE = {m: re.compile(_pi_field(m, "hasNextPage"), re.S) for m in MODES}
+PAGEINFO_PREV_RE = {m: re.compile(_pi_field(m, "hasPreviousPage"), re.S) for m in MODES}
 # Things that look like connections but are not (JS/Python call sites etc).
 NOT_GQL_NAMES = {"print", "console", "log", "range", "len", "dict", "list", "slice", "items",
                  "get", "post", "fetch", "query", "gql", "graphql", "json", "format"}
@@ -212,15 +258,15 @@ def selection_block(text, start):
     return None
 
 
-def direct_pageinfo(block, forward=True, backward=False):
+def direct_pageinfo(block, forward=True, backward=False, mode="host"):
     """Paging metadata selected at this connection's own level, for its own direction:
     `first:` (forward) needs pageInfo{hasNextPage}, `last:` (backward) needs
     pageInfo{hasPreviousPage}. Metadata for the other direction does not count."""
     if block is None:
         return False
-    if forward and PAGEINFO_NEXT_RE.search(block):
+    if forward and PAGEINFO_NEXT_RE[mode].search(block):
         return True
-    if backward and PAGEINFO_PREV_RE.search(block):
+    if backward and PAGEINFO_PREV_RE[mode].search(block):
         return True
     return False
 
@@ -228,7 +274,7 @@ def direct_pageinfo(block, forward=True, backward=False):
 def scan_text(path, text):
     findings = []
     lines = text.splitlines()
-    native = os.path.splitext(path)[1].lower() in NATIVE_GRAPHQL_EXTS
+    mode = source_mode(path)
     for m in CONN_RE.finditer(text):
         name, args = m.group(1), m.group(2)
         if name in NOT_GQL_NAMES or name[0].isupper():
@@ -237,17 +283,17 @@ def scan_text(path, text):
         # Python/JS kwargs `func(first=..)` use '=' so they never match ':'; JS object
         # literals `fn({first: 10})` contain '{' and are excluded by [^()]. Require
         # GraphQL-ish context: after optional directives/comments the next token is '{'.
-        k = DIRECTIVES_RE.match(text, m.end()).end()
+        k = DIRECTIVES_RE[mode].match(text, m.end()).end()
         if k >= len(text) or text[k] != "{":
             continue
         lineno = line_of(text, m.start())
-        top = top_level_args(args, native)
+        top = top_level_args(args, mode)
         if CURSOR_ARG_RE.search(top):
             continue
         backward = bool(LAST_ARG_RE.search(top))
         forward = bool(FIRST_ARG_RE.search(top)) or not backward
         block = selection_block(text, k)
-        if direct_pageinfo(block, forward, backward):
+        if direct_pageinfo(block, forward, backward, mode):
             continue
         if has_marker(lines, lineno, line_of(text, m.end())):
             continue
@@ -257,7 +303,7 @@ def scan_text(path, text):
         wrong_way = ""
         if block is not None and not (forward and backward):
             other = PAGEINFO_PREV_RE if forward else PAGEINFO_NEXT_RE
-            if other.search(block):
+            if other[mode].search(block):
                 wrong_way = (" (the pageInfo selected here pages the other direction and cannot "
                              "detect overflow for %s:)" % m.group(3))
         findings.append({
@@ -287,7 +333,7 @@ def scan_text(path, text):
     return findings
 
 
-PAGEINFO_REQ_RE = re.compile(_PI_HEAD + r"[^{}]*\bhasNextPage\b(?!\s*:)")
+PAGEINFO_REQ_RE = PAGEINFO_NEXT_RE   # one definition of "pageInfo{hasNextPage} requested"
 # Code that actually reads the cursor state (not the query text itself).
 PAGEINFO_READ_RE = re.compile(
     r"\.hasNextPage|\[\s*[\"']hasNextPage[\"']\s*\]|get\(\s*[\"']hasNextPage|"
@@ -303,7 +349,7 @@ HELPER_CALL_RE = re.compile(r"(?i)\b\w*(paginat|drain|walk_?pages|all_?pages|eac
 
 def scan_unread_pageinfo(path, text, lines):
     """Query asks for pageInfo{hasNextPage} but nothing in the file reads it."""
-    reqs = list(PAGEINFO_REQ_RE.finditer(text))
+    reqs = list(PAGEINFO_REQ_RE[source_mode(path)].finditer(text))
     if not reqs or PAGEINFO_READ_RE.search(text) or HELPER_CALL_RE.search(text):
         return []
     out = []

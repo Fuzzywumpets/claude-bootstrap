@@ -39,7 +39,7 @@ This is a **regex tripwire, not a GraphQL parser**. It catches the common "first
 Known gaps (each can give a missed finding, `m`, or a false finding, `f`):
 
 - `m` Upper-case field names are skipped (so TS/JS types and classes are not read as connections), and a few common names (`items`, `list`, `get`, `query`, ...) are skipped.
-- `m` A commented-out `pageInfo { hasNextPage }` inside a selection set still counts as selected. (`#` comments in the argument list are stripped since 2026-11-08.4, so a commented-out `after:`/`before:` no longer counts as a cursor.)
+- `m` A commented-out `pageInfo { hasNextPage }` inside a selection set still counts as selected. (`#` comments in the argument list are stripped since 2026-11-08.4, so a commented-out `after:`/`before:` no longer counts as a cursor. Since 2026-11-09.1 a comment always runs to its line end, also before a selection set; in host-language strings that line ends at a `\n`/`\r` escape, and `\n`/`\r`/`\t` escapes count as whitespace; `pageInfo` must be the whole field name.)
 - `m` Parentheses inside a string argument hide the connection (arguments are matched without nested parens).
 - `m` `.html` files are not scanned, so inline browser JavaScript is not covered.
 - `f` Aliased paging-state reads (`hasNextPage: more`) in consumer code can produce a false `pageinfo-unread`.

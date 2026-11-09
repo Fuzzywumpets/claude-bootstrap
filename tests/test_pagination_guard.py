@@ -1064,7 +1064,135 @@ class CommaBeforePageInfoSelectionFailsClosed(unittest.TestCase):
         self.assertEqual(scan("assert.deepEqual(pageInfo, { hasNextPage, endCursor });\n"), [])
 
     def test_version_was_bumped(self):
-        self.assertEqual(guard.GUARD_VERSION, "2026-11-08.4")
+        self.assertEqual(guard.GUARD_VERSION, "2026-11-09.1")
+
+
+
+# --------------------------------------------------------------------------------------
+# DeepReview (tools-mcp #5 re-review, 2026-11-08): pageInfo must be the whole field name; host-code
+# escapes and comments before a selection set
+# --------------------------------------------------------------------------------------
+class PageInfoIsAWholeFieldName(unittest.TestCase):
+    READ = "\nconsole.log(result.custompageInfo.hasNextPage);"
+
+    def test_field_ending_in_pageinfo_does_not_satisfy(self):
+        # the exact DeepReview case
+        src = "const q = `things(first: 10) { custompageInfo { hasNextPage } }`;" + self.READ
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_field_ending_in_pageinfo_with_haspreviouspage_does_not_satisfy_last(self):
+        self.assertEqual(len(conn("const q = `{ things(last: 10) { nodes { id } mypageInfo { hasPreviousPage } } }`;")), 1)
+
+    def test_field_ending_in_pageinfo_is_not_a_pageinfo_request(self):
+        self.assertEqual(unread("const q = `{ x { mypageInfo { hasNextPage } } }`;"), [])
+
+    def test_real_pageinfo_still_satisfies(self):
+        src = "const q = `{ things(first: 10) { nodes { id } pageInfo { hasNextPage } } }`;\nconst more = r.things.pageInfo.hasNextPage;"
+        self.assertEqual(scan(src), [])
+
+
+class HostEscapesBeforeASelectionSet(unittest.TestCase):
+    """In a one-line host-language string, `\n` escapes are GraphQL newlines before a selection set too."""
+
+    def test_comment_before_the_selection_set_ends_at_a_newline_escape(self):
+        # the exact DeepReview case: the selection set follows the escaped newline
+        self.assertEqual(len(conn('const q = "query { orders(first: 10) # comment\\n { nodes { id } } }";')), 1)
+
+    def test_real_newline_control(self):
+        self.assertEqual(len(conn('const q = `query { orders(first: 10) # comment\n { nodes { id } } }`;')), 1)
+
+    def test_escaped_newline_without_a_comment(self):
+        self.assertEqual(len(conn('const q = "query { orders(first: 10)\\n{ nodes { id } } }";')), 1)
+
+    def test_escaped_tab_and_carriage_return(self):
+        self.assertEqual(len(conn('const q = "query { orders(first: 10)\\r\\n\\t{ nodes { id } } }";')), 1)
+
+    def test_comment_then_escape_then_directive(self):
+        self.assertEqual(len(conn('const q = "query { orders(first: 10) # c\\n @include(if: $x) { nodes { id } } }";')), 1)
+
+    def test_cursor_still_satisfies_after_an_escaped_comment(self):
+        self.assertEqual(conn('const q = "query { orders(first: 10, after: $c) # c\\n { nodes { id } } }";'), [])
+
+    def test_native_graphql_newline_escape_text_stays_inside_the_comment(self):
+        # in a .graphql document `\n` is comment text: the selection set is the one on the next real line
+        src = "query { orders(first: 10) # c\\n { ignored }\n { nodes { id } } }"
+        found = conn(src, "q.graphql")
+        self.assertEqual([f["line"] for f in found], [1])
+
+    def test_pageinfo_with_a_comment_and_escape_before_its_selection_set(self):
+        src = ('const q = "query { orders(first: 10) { nodes { id } pageInfo # page\\n { hasNextPage } } }";\n'
+               "const more = res.orders.pageInfo.hasNextPage;")
+        self.assertEqual(scan(src), [])
+
+    def test_pageinfo_with_an_escaped_newline_before_its_selection_set(self):
+        src = ('const q = "query { orders(first: 10) { nodes { id } pageInfo\\n{ hasNextPage } } }";\n'
+               "const more = res.orders.pageInfo.hasNextPage;")
+        self.assertEqual(scan(src), [])
+
+    def test_a_comment_cannot_end_early_to_borrow_a_commented_selection(self):
+        # pageInfo's real selection is { startCursor }; `{ hasNextPage }` sits inside the comment
+        tail = "\nconst more = res.orders.pageInfo.hasNextPage;"
+        native = "query { orders(first: 10) { nodes { id } pageInfo # { hasNextPage }\n { startCursor } } }"
+        self.assertEqual(len(conn(native, "q.graphql")), 1)
+        host = 'const q = "query { orders(first: 10) { nodes { id } pageInfo # { hasNextPage }\\n { startCursor } } }";' + tail
+        self.assertEqual(len(conn(host)), 1)
+
+    def test_unread_pageinfo_behind_an_escape_is_still_flagged(self):
+        self.assertEqual(len(unread('const q = "{ things(first: 10) { nodes { id } pageInfo\\n{ hasNextPage } } }";')), 1)
+
+
+
+class FixRoundForClaudeBootstrap3(unittest.TestCase):
+    """DeepReview 20261109-002307-863f9208 on claude-bootstrap #3: escape-aware name boundaries; `#{`
+    is only Ruby interpolation."""
+    READ = "\nconst more = result.things.pageInfo.hasNextPage;"
+
+    def test_pageinfo_right_after_an_escaped_newline_satisfies(self):
+        for esc in ("\\n", "\\r", "\\t"):
+            src = 'const q = "{ things(first: 10) { nodes { id }%spageInfo { hasNextPage } } }";' % esc + self.READ
+            self.assertEqual(scan(src), [], esc)
+
+    def test_pageinfo_right_after_an_escape_is_still_an_unread_request(self):
+        self.assertEqual(len(unread('const q = "{ things(first: 10) { nodes { id }\\npageInfo { hasNextPage } } }";')), 1)
+
+    def test_custompageinfo_after_an_escape_is_still_another_field(self):
+        src = 'const q = "{ things(first: 10) { nodes { id }\\ncustompageInfo { hasNextPage } } }";' + self.READ
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_hasnextpage_right_after_an_escape_satisfies(self):
+        src = 'const q = "{ things(first: 10) { nodes { id } pageInfo {\\nhasNextPage\\n} } }";' + self.READ
+        self.assertEqual(scan(src), [])
+
+    def test_alias_across_an_escaped_newline_does_not_satisfy(self):
+        src = 'const q = "{ things(first: 10) { nodes { id } pageInfo { hasNextPage\\n: hasPreviousPage } } }";' + self.READ
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_native_escape_text_is_not_a_name_boundary(self):
+        # in a .graphql document `\npageInfo` is the text "npageInfo"-ish garbage, not a pageInfo field
+        src = "query { things(first: 10) { nodes { id } x\\npageInfo { hasNextPage } } }"
+        self.assertEqual(len(conn(src, "q.graphql")), 1)
+
+    def test_hash_brace_comment_in_javascript_is_a_comment(self):
+        # the exact DeepReview case: `#{note}` is GraphQL comment text outside Ruby
+        self.assertEqual(len(conn("const q = `query { orders(first: 10) #{note}\n { nodes { id } } }`;")), 1)
+
+    def test_hash_brace_comment_in_javascript_arguments(self):
+        self.assertEqual(len(conn("const q = `query { orders(first: 10 #{after: $c}\n) { nodes { id } } }`;")), 1)
+
+    def test_ruby_interpolation_before_the_selection_set_is_not_a_comment(self):
+        # in Ruby `#{x}` is interpolation, so the selection set that follows on the same line is seen
+        self.assertEqual(len(conn('q = "{ orders(first: 10) #{dirs} { nodes { id } } }"\n', "x.rb")), 0)
+
+
+    def test_escape_before_directive_arguments_is_whitespace(self):
+        # DeepReview 20261109-002528-49e89be6 (round 2 on #3): `@include\n(if: true)` in a one-line string
+        for esc in ("\\n", "\\r", "\\t"):
+            self.assertEqual(len(conn('const q = "{ things(first: 10) @include%s(if: true) { nodes { id } } }";' % esc)), 1, esc)
+        self.assertEqual(len(conn("const q = `{ things(first: 10) @include\n(if: true) { nodes { id } } }`;")), 1)
+
+    def test_escape_before_directive_arguments_on_pageinfo(self):
+        src = 'const q = "{ things(first: 10) { nodes { id } pageInfo @include\\n(if: true) { hasNextPage } } }";' + self.READ
+        self.assertEqual(scan(src), [])
 
 
 if __name__ == "__main__":
