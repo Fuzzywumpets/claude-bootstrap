@@ -42,9 +42,11 @@ Known gaps (each can give a missed finding, `m`, or a false finding, `f`):
 - `m` A commented-out `pageInfo { hasNextPage }` inside a selection set still counts as selected. (`#` comments in the argument list are stripped since 2026-11-08.4, so a commented-out `after:`/`before:` no longer counts as a cursor. Since 2026-11-09.1 a comment always runs to its line end, also before a selection set; in host-language strings that line ends at a `\n`/`\r` escape, and `\n`/`\r`/`\t` escapes count as whitespace; `pageInfo` must be the whole field name.)
 - `m` Parentheses inside a string argument hide the connection (arguments are matched without nested parens).
 - `m` `.html` files are not scanned, so inline browser JavaScript is not covered.
+- `m` REST page sizes are matched only with 2 to 4 digits: `limit=5` (any single digit) and `limit=10000` or more are not flagged. (Added 2026-11-09, Alex's Q7 "stop the chase".)
 - `f` Aliased paging-state reads (`hasNextPage: more`) in consumer code can produce a false `pageinfo-unread`.
 - `f` A `BOUNDED:` marker is not honoured for the unread-`pageInfo` check in every layout; JS destructured parameters can look like connections.
 - `f` A comma before pageInfo's selection set (`pageInfo, { hasNextPage }`, legal GraphQL) is rejected on purpose: file-wide text cannot tell it from a JS call `f(pageInfo, { hasNextPage })`, so the guard fails closed. Drop the comma.
+- `f` A host-language `\n`/`\r`/`\t` escape directly before `after:`/`before:` (`"orders(first: 100,\nafter: $cursor)"`) hides the cursor, because the cursor match needs a word boundary and the escape ends in a letter, so a paged connection is flagged. Put a space after the escape or use a real newline. (Added 2026-11-09, Alex's Q7 "stop the chase".)
 
 When a case matters, add a `BOUNDED:` marker with the reason, or fix the query. Fix the guard here, with a test, and re-sync every vendored copy in the same change.
 
