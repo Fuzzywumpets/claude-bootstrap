@@ -1064,7 +1064,81 @@ class CommaBeforePageInfoSelectionFailsClosed(unittest.TestCase):
         self.assertEqual(scan("assert.deepEqual(pageInfo, { hasNextPage, endCursor });\n"), [])
 
     def test_version_was_bumped(self):
-        self.assertEqual(guard.GUARD_VERSION, "2026-11-08.4")
+        self.assertEqual(guard.GUARD_VERSION, "2026-11-09.1")
+
+
+
+# --------------------------------------------------------------------------------------
+# DeepReview (tools-mcp #5 re-review, 2026-11-08): pageInfo must be the whole field name; host-code
+# escapes and comments before a selection set
+# --------------------------------------------------------------------------------------
+class PageInfoIsAWholeFieldName(unittest.TestCase):
+    READ = "\nconsole.log(result.custompageInfo.hasNextPage);"
+
+    def test_field_ending_in_pageinfo_does_not_satisfy(self):
+        # the exact DeepReview case
+        src = "const q = `things(first: 10) { custompageInfo { hasNextPage } }`;" + self.READ
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_field_ending_in_pageinfo_with_haspreviouspage_does_not_satisfy_last(self):
+        self.assertEqual(len(conn("const q = `{ things(last: 10) { nodes { id } mypageInfo { hasPreviousPage } } }`;")), 1)
+
+    def test_field_ending_in_pageinfo_is_not_a_pageinfo_request(self):
+        self.assertEqual(unread("const q = `{ x { mypageInfo { hasNextPage } } }`;"), [])
+
+    def test_real_pageinfo_still_satisfies(self):
+        src = "const q = `{ things(first: 10) { nodes { id } pageInfo { hasNextPage } } }`;\nconst more = r.things.pageInfo.hasNextPage;"
+        self.assertEqual(scan(src), [])
+
+
+class HostEscapesBeforeASelectionSet(unittest.TestCase):
+    """In a one-line host-language string, `\n` escapes are GraphQL newlines before a selection set too."""
+
+    def test_comment_before_the_selection_set_ends_at_a_newline_escape(self):
+        # the exact DeepReview case: the selection set follows the escaped newline
+        self.assertEqual(len(conn('const q = "query { orders(first: 10) # comment\\n { nodes { id } } }";')), 1)
+
+    def test_real_newline_control(self):
+        self.assertEqual(len(conn('const q = `query { orders(first: 10) # comment\n { nodes { id } } }`;')), 1)
+
+    def test_escaped_newline_without_a_comment(self):
+        self.assertEqual(len(conn('const q = "query { orders(first: 10)\\n{ nodes { id } } }";')), 1)
+
+    def test_escaped_tab_and_carriage_return(self):
+        self.assertEqual(len(conn('const q = "query { orders(first: 10)\\r\\n\\t{ nodes { id } } }";')), 1)
+
+    def test_comment_then_escape_then_directive(self):
+        self.assertEqual(len(conn('const q = "query { orders(first: 10) # c\\n @include(if: $x) { nodes { id } } }";')), 1)
+
+    def test_cursor_still_satisfies_after_an_escaped_comment(self):
+        self.assertEqual(conn('const q = "query { orders(first: 10, after: $c) # c\\n { nodes { id } } }";'), [])
+
+    def test_native_graphql_newline_escape_text_stays_inside_the_comment(self):
+        # in a .graphql document `\n` is comment text: the selection set is the one on the next real line
+        src = "query { orders(first: 10) # c\\n { ignored }\n { nodes { id } } }"
+        found = conn(src, "q.graphql")
+        self.assertEqual([f["line"] for f in found], [1])
+
+    def test_pageinfo_with_a_comment_and_escape_before_its_selection_set(self):
+        src = ('const q = "query { orders(first: 10) { nodes { id } pageInfo # page\\n { hasNextPage } } }";\n'
+               "const more = res.orders.pageInfo.hasNextPage;")
+        self.assertEqual(scan(src), [])
+
+    def test_pageinfo_with_an_escaped_newline_before_its_selection_set(self):
+        src = ('const q = "query { orders(first: 10) { nodes { id } pageInfo\\n{ hasNextPage } } }";\n'
+               "const more = res.orders.pageInfo.hasNextPage;")
+        self.assertEqual(scan(src), [])
+
+    def test_a_comment_cannot_end_early_to_borrow_a_commented_selection(self):
+        # pageInfo's real selection is { startCursor }; `{ hasNextPage }` sits inside the comment
+        tail = "\nconst more = res.orders.pageInfo.hasNextPage;"
+        native = "query { orders(first: 10) { nodes { id } pageInfo # { hasNextPage }\n { startCursor } } }"
+        self.assertEqual(len(conn(native, "q.graphql")), 1)
+        host = 'const q = "query { orders(first: 10) { nodes { id } pageInfo # { hasNextPage }\\n { startCursor } } }";' + tail
+        self.assertEqual(len(conn(host)), 1)
+
+    def test_unread_pageinfo_behind_an_escape_is_still_flagged(self):
+        self.assertEqual(len(unread('const q = "{ things(first: 10) { nodes { id } pageInfo\\n{ hasNextPage } } }";')), 1)
 
 
 if __name__ == "__main__":
