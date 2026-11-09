@@ -144,18 +144,18 @@ def _name_start(mode):
     return r"(?<!\w)" if mode == "native" else r"(?:(?<!\w)|(?<=\\[nrt]))"
 
 
-def _directives(ign):
-    return r"(?:@[A-Za-z_]\w*(?:\s*\([^()]*\))?" + ign + r")*"
+def _directives(mode, ign):
+    return r"(?:@[A-Za-z_]\w*(?:%s*\([^()]*\))?" % _ws(mode) + ign + r")*"
 
 
 # Between the arguments and the selection set GraphQL allows directives (`@include(if: $x)`,
 # `@live`) and ignored tokens. Keyed by source mode.
-DIRECTIVES_RE = {m: re.compile(_ignored(m, True) + _directives(_ignored(m, True))) for m in MODES}
+DIRECTIVES_RE = {m: re.compile(_ignored(m, True) + _directives(m, _ignored(m, True))) for m in MODES}
 # Own-level pageInfo, per paging direction: forward needs hasNextPage, backward hasPreviousPage.
 # `pageInfo` must be the whole field name (`custompageInfo` is another field) and may carry directives
 # (`pageInfo @include(if: $x) { ... }`) just like any field.
 # No bare commas here (unlike DIRECTIVES_RE): `pageInfo, { hasNextPage: ... }` is a JS object literal.
-_PI_HEAD = {m: _name_start(m) + r"pageInfo" + _ignored(m, False) + _directives(_ignored(m, False)) + r"\{"
+_PI_HEAD = {m: _name_start(m) + r"pageInfo" + _ignored(m, False) + _directives(m, _ignored(m, False)) + r"\{"
             for m in MODES}
 
 

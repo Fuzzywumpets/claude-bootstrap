@@ -1184,5 +1184,16 @@ class FixRoundForClaudeBootstrap3(unittest.TestCase):
         self.assertEqual(len(conn('q = "{ orders(first: 10) #{dirs} { nodes { id } } }"\n', "x.rb")), 0)
 
 
+    def test_escape_before_directive_arguments_is_whitespace(self):
+        # DeepReview 20261109-002528-49e89be6 (round 2 on #3): `@include\n(if: true)` in a one-line string
+        for esc in ("\\n", "\\r", "\\t"):
+            self.assertEqual(len(conn('const q = "{ things(first: 10) @include%s(if: true) { nodes { id } } }";' % esc)), 1, esc)
+        self.assertEqual(len(conn("const q = `{ things(first: 10) @include\n(if: true) { nodes { id } } }`;")), 1)
+
+    def test_escape_before_directive_arguments_on_pageinfo(self):
+        src = 'const q = "{ things(first: 10) { nodes { id } pageInfo @include\\n(if: true) { hasNextPage } } }";' + self.READ
+        self.assertEqual(scan(src), [])
+
+
 if __name__ == "__main__":
     unittest.main()
