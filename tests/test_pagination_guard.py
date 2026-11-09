@@ -1141,5 +1141,48 @@ class HostEscapesBeforeASelectionSet(unittest.TestCase):
         self.assertEqual(len(unread('const q = "{ things(first: 10) { nodes { id } pageInfo\\n{ hasNextPage } } }";')), 1)
 
 
+
+class FixRoundForClaudeBootstrap3(unittest.TestCase):
+    """DeepReview 20261109-002307-863f9208 on claude-bootstrap #3: escape-aware name boundaries; `#{`
+    is only Ruby interpolation."""
+    READ = "\nconst more = result.things.pageInfo.hasNextPage;"
+
+    def test_pageinfo_right_after_an_escaped_newline_satisfies(self):
+        for esc in ("\\n", "\\r", "\\t"):
+            src = 'const q = "{ things(first: 10) { nodes { id }%spageInfo { hasNextPage } } }";' % esc + self.READ
+            self.assertEqual(scan(src), [], esc)
+
+    def test_pageinfo_right_after_an_escape_is_still_an_unread_request(self):
+        self.assertEqual(len(unread('const q = "{ things(first: 10) { nodes { id }\\npageInfo { hasNextPage } } }";')), 1)
+
+    def test_custompageinfo_after_an_escape_is_still_another_field(self):
+        src = 'const q = "{ things(first: 10) { nodes { id }\\ncustompageInfo { hasNextPage } } }";' + self.READ
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_hasnextpage_right_after_an_escape_satisfies(self):
+        src = 'const q = "{ things(first: 10) { nodes { id } pageInfo {\\nhasNextPage\\n} } }";' + self.READ
+        self.assertEqual(scan(src), [])
+
+    def test_alias_across_an_escaped_newline_does_not_satisfy(self):
+        src = 'const q = "{ things(first: 10) { nodes { id } pageInfo { hasNextPage\\n: hasPreviousPage } } }";' + self.READ
+        self.assertEqual(len(conn(src)), 1)
+
+    def test_native_escape_text_is_not_a_name_boundary(self):
+        # in a .graphql document `\npageInfo` is the text "npageInfo"-ish garbage, not a pageInfo field
+        src = "query { things(first: 10) { nodes { id } x\\npageInfo { hasNextPage } } }"
+        self.assertEqual(len(conn(src, "q.graphql")), 1)
+
+    def test_hash_brace_comment_in_javascript_is_a_comment(self):
+        # the exact DeepReview case: `#{note}` is GraphQL comment text outside Ruby
+        self.assertEqual(len(conn("const q = `query { orders(first: 10) #{note}\n { nodes { id } } }`;")), 1)
+
+    def test_hash_brace_comment_in_javascript_arguments(self):
+        self.assertEqual(len(conn("const q = `query { orders(first: 10 #{after: $c}\n) { nodes { id } } }`;")), 1)
+
+    def test_ruby_interpolation_before_the_selection_set_is_not_a_comment(self):
+        # in Ruby `#{x}` is interpolation, so the selection set that follows on the same line is seen
+        self.assertEqual(len(conn('q = "{ orders(first: 10) #{dirs} { nodes { id } } }"\n', "x.rb")), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
